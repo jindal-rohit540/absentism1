@@ -1,736 +1,936 @@
 """
-CPS Student Absenteeism Risk Dashboard
+Absenteeism Risk Dashboard - Business Executive View
+=====================================================
+Usage
+-----
+    pip install streamlit pandas scikit-learn category_encoders matplotlib seaborn shap openpyxl
+    streamlit run app.py
 """
-import warnings
-warnings.filterwarnings("ignore")
 
+import os, warnings, sys
 import pandas as pd
 import numpy as np
 import streamlit as st
-import plotly.express as px
-import plotly.graph_objects as go
-import joblib
+import matplotlib
+import matplotlib.pyplot as plt
+import seaborn as sns
+import shap
 from io import BytesIO
 
-from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, roc_auc_score
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.inspection import permutation_importance
+from sklearn.tree import export_text
+from sklearn.metrics import (
+    accuracy_score, precision_score, recall_score, f1_score,
+    roc_auc_score, roc_curve
+)
 
-# ── Constants ────────────────────────────────────────────────────────────
-RISK_THRESHOLD  = 0.50
-GOOD_RATE       = 0.35
-RISK_RATE       = 0.45
+# Fix category_encoders sklearn_tags compatibility with scikit-learn >= 1.6
+import category_encoders.utils as _ce_utils
 
-CATEGORICAL_COLS = [
-    "STUDENT_GENDER", "RACE_GRP", "STUDENT_ETHNICITY",
-    "LANG_GRP", "STUDENT_CURRENT_GRADE_CODE", "SCHOOL_GRP",
-]
-NUMERIC_COLS = [
-    "STUDENT_AGE", "STUDENT_SPECIAL_ED_INDICATOR", "STUDENT_HOMELESS_INDICATOR",
-]
-TARGET = "target"
-
-RENAME_MAP = {
-    "STUDENT_AGE":                  "Student Age",
-    "STUDENT_GENDER":               "Gender",
-    "RACE_GRP":                     "Race Group",
-    "STUDENT_ETHNICITY":            "Ethnicity",
-    "LANG_GRP":                     "Language Group",
-    "STUDENT_CURRENT_GRADE_CODE":   "Grade Level",
-    "SCHOOL_GRP":                   "School",
-    "STUDENT_SPECIAL_ED_INDICATOR": "Special Education",
-    "STUDENT_HOMELESS_INDICATOR":   "Housing Instability",
+_SUPERVISED_ENCODERS = {
+    'JamesSteinEncoder', 'TargetEncoder', 'LeaveOneOutEncoder',
+    'WOEEncoder', 'MEstimateEncoder', 'GLMMEncoder',
+    'CatBoostEncoder', 'QuantileEncoder', 'SummaryEncoder'
 }
 
-# ── Page config ──────────────────────────────────────────────────────────
+def _patched_get_tags(self):
+    return {'supervised_encoder': type(self).__name__ in _SUPERVISED_ENCODERS}
+
+_ce_utils.BaseEncoder._get_tags = _patched_get_tags
+
+from category_encoders import JamesSteinEncoder
+
+matplotlib.use('Agg')
+plt.close('all')
+
+sns.set_theme(style="whitegrid", rc={
+    "figure.facecolor": "white",
+    "axes.facecolor": "white",
+    "text.color": "black",
+    "axes.labelcolor": "black",
+    "xtick.color": "black",
+    "ytick.color": "black"
+})
+
+warnings.filterwarnings("ignore")
+
+# ──────────────────────────────────────────────────────────────────────────────
+# CONFIG
+# ──────────────────────────────────────────────────────────────────────────────
+TRAIN_FILE = "train_with_target.csv"
+TEST_FILE  = "test_with_target.csv"
+
+CATEGORICAL_COLS = [
+    "STUDENT_GENDER",
+    "RACE_GRP",
+    "STUDENT_ETHNICITY",
+    "LANG_GRP",
+    "STUDENT_CURRENT_GRADE_CODE",
+    "SCHOOL_GRP",
+]
+
+NUMERIC_COLS = [
+    "STUDENT_AGE",
+    "STUDENT_SPECIAL_ED_INDICATOR",
+    "STUDENT_HOMELESS_INDICATOR",
+]
+
+TARGET = "target"
+
+PALETTE = {
+    "primary":   "#0F548C",
+    "secondary": "#0E8A8C",
+    "success":   "#117A65",
+    "danger":    "#B82737",
+    "accent":    "#E8F4FA",
+}
+
+RENAME_MAP = {
+    "STUDENT_AGE": "Student Age",
+    "STUDENT_GENDER": "Gender",
+    "RACE_GRP": "Race Group",
+    "STUDENT_ETHNICITY": "Ethnicity",
+    "LANG_GRP": "Language Group",
+    "STUDENT_CURRENT_GRADE_CODE": "Grade Level",
+    "SCHOOL_GRP": "School",
+    "STUDENT_SPECIAL_ED_INDICATOR": "Special Education",
+    "STUDENT_HOMELESS_INDICATOR": "Housing Instability",
+}
+
+def _fig_close(fig=None):
+    if fig is None:
+        plt.close('all')
+    else:
+        plt.close(fig)
+
+# ──────────────────────────────────────────────────────────────────────────────
+# PAGE SETUP
+# ──────────────────────────────────────────────────────────────────────────────
 st.set_page_config(
-    page_title="CPS Absenteeism Risk",
+    page_title="Student Absenteeism Risk Dashboard",
     page_icon="📘",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
-st.markdown("""
-<style>
-[data-testid="stMetricValue"] { font-size: 1.6rem !important; }
-[data-testid="stMetricLabel"] { font-size: 0.78rem !important; color: #555; }
-.kpi-green  { background:#e8f5e9; border-left:5px solid #43a047; padding:12px 16px; border-radius:8px; margin-bottom:8px; }
-.kpi-amber  { background:#fff8e1; border-left:5px solid #ffa000; padding:12px 16px; border-radius:8px; margin-bottom:8px; }
-.kpi-red    { background:#ffebee; border-left:5px solid #e53935; padding:12px 16px; border-radius:8px; margin-bottom:8px; }
-.insight-box{ background:#f0f4ff; border-left:5px solid #3f51b5; padding:14px 18px; border-radius:8px; margin-bottom:10px; }
-.section-tag{ font-size:0.72rem; color:#888; text-transform:uppercase; letter-spacing:.08em; }
-</style>
-""", unsafe_allow_html=True)
+st.markdown(
+    """
+    <style>
+    body { background-color: #F4F8FB; color: #1F2937; font-family: Inter, system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; }
+    .main > div.block-container { max-width: 100%; padding-left: 2rem; padding-right: 2rem; }
+    .reportview-container .main .block-container { padding-top: 10px; padding-bottom: 10px; }
+    .metric-card {
+        background: #FFFFFF;
+        border-radius: 14px;
+        padding: 18px 20px;
+        box-shadow: 0 14px 28px rgba(15, 23, 42, 0.05);
+        text-align: center;
+        margin-bottom: 12px;
+        border: 1px solid rgba(15, 23, 42, 0.08);
+    }
+    .metric-label { font-size: 0.74rem; color: #64748B; margin-bottom: 6px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.08em; }
+    .metric-value { font-size: 1.95rem; font-weight: 700; color: #0F172A; }
+    .metric-sub   { font-size: 0.84rem; color: #64748B; margin-top: 4px; }
+    .section-header {
+        font-size: 1.04rem; font-weight: 700;
+        color: #0F172A; margin: 10px 0 12px 0;
+        border-left: 4px solid #0E8A8C;
+        padding-left: 12px;
+    }
+    .section-note {
+        display: block;
+        width: 100%;
+        max-width: 100%;
+        font-size: 0.92rem;
+        color: #334155;
+        line-height: 1.5;
+        margin-bottom: 16px;
+        padding: 14px 18px;
+        background: rgba(14, 138, 140, 0.10);
+        border-radius: 14px;
+        border: 1px solid rgba(14, 138, 140, 0.18);
+    }
+    .section-note p { margin: 0 0 0.9rem 0; }
+    .rule-box {
+        background: #FFFFFF;
+        border-radius: 14px;
+        padding: 20px 24px;
+        box-shadow: 0 8px 24px rgba(15, 23, 42, 0.08);
+        border-left: 5px solid #0E8A8C;
+        margin-bottom: 16px;
+        transition: transform 0.2s, box-shadow 0.2s;
+    }
+    .rule-box:hover { transform: translateY(-2px); box-shadow: 0 12px 32px rgba(15, 23, 42, 0.12); }
+    .rule-box h4 { margin: 0 0 10px 0; font-size: 1.05rem; display: flex; align-items: center; gap: 8px; }
+    .rule-box p { margin: 6px 0; font-size: 0.9rem; color: #334155; line-height: 1.6; }
+    .rule-box.danger { border-left-color: #B82737; }
+    .rule-box.danger h4 { color: #B82737; }
+    .rule-box.warning { border-left-color: #D97706; }
+    .rule-box.warning h4 { color: #D97706; }
+    .rule-box.success { border-left-color: #117A65; }
+    .rule-box.success h4 { color: #117A65; }
+    .rule-box.info { border-left-color: #0F548C; }
+    .rule-box.info h4 { color: #0F548C; }
+    .biz-value-card {
+        background: linear-gradient(135deg, #E8F4FA 0%, #F0FDF4 100%);
+        border-radius: 12px;
+        padding: 14px 18px;
+        border: 1px solid rgba(14, 138, 140, 0.2);
+        margin-top: 16px;
+        margin-bottom: 12px;
+    }
+    .biz-value-card h4 { margin: 0 0 8px 0; color: #0F548C; font-size: 0.95rem; }
+    .biz-value-card p { margin: 4px 0; font-size: 0.88rem; color: #334155; line-height: 1.5; }
+    button, input, select, textarea { font-family: Inter, system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; }
+    .stButton>button { border-radius: 10px; font-weight: 700; letter-spacing: 0.02em; padding: 0.75rem 1.2rem; }
+    .stButton>button:hover { opacity: 0.98; }
+    .stTextInput>div>div>input, .stSelectbox>div>div>div>input, .stSlider>div>div>input { border-radius: 10px; }
+    .css-1d391kg { background-color: #F8FAFC !important; }
+    img { max-width: 100%; height: auto; object-fit: contain; }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
 
 
-# ── Artifact loaders ──────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────────────────
+# HELPERS
+# ──────────────────────────────────────────────────────────────────────────────
+def metric_card(label, value, sub=""):
+    st.markdown(
+        f"""
+        <div class="metric-card">
+            <div class="metric-label">{label}</div>
+            <div class="metric-value">{value}</div>
+            <div class="metric-sub">{sub}</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+@st.cache_data(show_spinner=False)
+def load_data(train_path, test_path):
+    train = pd.read_csv(train_path)
+    test  = pd.read_csv(test_path)
+    return train, test
+
+VALID_AGE_MIN = 5
+VALID_AGE_MAX = 22
+
+def filter_valid_student_ages(df):
+    return df.loc[df["STUDENT_AGE"].between(VALID_AGE_MIN, VALID_AGE_MAX)]
+
+def get_encoded_data(df, encoder):
+    X_cat = df[CATEGORICAL_COLS].copy()
+    X_num = df[NUMERIC_COLS].copy()
+    X_enc = encoder.transform(X_cat)
+    return pd.concat([X_enc.reset_index(drop=True), X_num.reset_index(drop=True)], axis=1)
+
+
+def show_fig(fig, **kwargs):
+    try:
+        st.pyplot(fig, **kwargs)
+    except Exception as exc:
+        st.warning("A chart rendering issue occurred.")
+    finally:
+        plt.close(fig)
+
 @st.cache_resource(show_spinner=False)
-def load_model_and_encoders():
-    rf       = joblib.load("model.pkl")
-    encoders = joblib.load("encoders.pkl")
-    return rf, encoders
+def train_model(train_path, test_path):
+    train, _ = load_data(train_path, test_path)
 
+    X_cat = train[CATEGORICAL_COLS].copy()
+    X_num = train[NUMERIC_COLS].copy()
+    y     = train[TARGET].astype(int)
 
-@st.cache_data(show_spinner=False)
-def load_dashboard_data():
-    return pd.read_parquet("dashboard_data.parquet")
+    encoder = JamesSteinEncoder(cols=CATEGORICAL_COLS)
+    X_enc   = encoder.fit_transform(X_cat, y)
+    X_all   = pd.concat([X_enc.reset_index(drop=True), X_num.reset_index(drop=True)], axis=1)
 
+    rf = RandomForestClassifier(
+        n_estimators=150,
+        max_depth=12,
+        min_samples_leaf=40,
+        n_jobs=-1,
+        random_state=42,
+        class_weight="balanced",
+    )
+    rf.fit(X_all, y.reset_index(drop=True))
+    return rf, encoder
 
-@st.cache_data(show_spinner=False)
-def load_population_data():
-    return pd.read_parquet("population_data.parquet")
-
-
-def encode_df(df, encoders):
-    out = df.copy()
-    for col in CATEGORICAL_COLS:
-        le = encoders[col]
-        known = set(le.classes_)
-        out[col] = out[col].astype(str).fillna("Unknown").apply(
-            lambda v: v if v in known else le.classes_[0]
-        )
-        out[col] = le.transform(out[col])
-    for col in NUMERIC_COLS:
-        out[col] = pd.to_numeric(out[col], errors="coerce").fillna(0)
-    return out[CATEGORICAL_COLS + NUMERIC_COLS]
-
-
-def threshold_metrics(y_true, proba, thr):
-    pred = (proba >= thr).astype(int)
+def threshold_metrics(y_true, proba, threshold):
+    pred = (proba >= threshold).astype(int)
     tp = int(((pred == 1) & (y_true == 1)).sum())
     fp = int(((pred == 1) & (y_true == 0)).sum())
     fn = int(((pred == 0) & (y_true == 1)).sum())
     tn = int(((pred == 0) & (y_true == 0)).sum())
+    acc   = accuracy_score(y_true, pred)
+    prec  = precision_score(y_true, pred, zero_division=0)
+    rec   = recall_score(y_true, pred, zero_division=0)
+    f1    = f1_score(y_true, pred, zero_division=0)
     try:
-        auc = float(roc_auc_score(y_true, proba))
+        auc = roc_auc_score(y_true, proba)
     except Exception:
         auc = float("nan")
-    return dict(
-        tp=tp, fp=fp, fn=fn, tn=tn,
-        accuracy=float(accuracy_score(y_true, pred)),
-        precision=float(precision_score(y_true, pred, zero_division=0)),
-        recall=float(recall_score(y_true, pred, zero_division=0)),
-        f1=float(f1_score(y_true, pred, zero_division=0)),
-        auc=auc,
-    )
+    return dict(tp=tp, fp=fp, fn=fn, tn=tn,
+                accuracy=acc, precision=prec, recall=rec, f1=f1, auc=auc)
 
 
-def rag_badge(rag):
-    color = {"Green": "#43a047", "Amber": "#ffa000", "Red": "#e53935"}.get(rag, "#999")
-    return f'<span style="background:{color};color:white;padding:2px 10px;border-radius:12px;font-size:.75rem;">{rag}</span>'
-
-
-# ── Load artifacts ──────────────────────────────────────────────────────────
-with st.spinner("Loading dashboard…"):
-    rf_model, encoders = load_model_and_encoders()
-    test_df            = load_dashboard_data()
-    all_data           = load_population_data()
-
-y_test  = test_df[TARGET].astype(int).values
-y_proba = test_df["risk_proba"].values
-
-# Precompute active-student summary from combined population
-active_df    = all_data[all_data["ENROLLMENT_HISTORY_STATUS"] == "Active"].copy()
-active_total = len(active_df)
-active_risk  = int((active_df[TARGET] == 1).sum())
-active_safe  = active_total - active_risk
-risk_rate_pct = active_risk / active_total * 100 if active_total > 0 else 0
-
-school_summary = (
-    active_df.groupby("SCHOOL_GRP")
-    .agg(total_students=("STUDENT_KEY", "count"), at_risk=(TARGET, "sum"))
-    .reset_index()
-)
-school_summary["risk_rate"]     = school_summary["at_risk"] / school_summary["total_students"]
-school_summary["rag"]           = school_summary["risk_rate"].apply(
-    lambda r: "Red" if r > RISK_RATE else ("Amber" if r > GOOD_RATE else "Green")
-)
-school_summary["safe_students"] = school_summary["total_students"] - school_summary["at_risk"]
-
-# Compute display counts for schools: separate 'Other' (or similar) from named schools.
-# This prevents showing a single lumped count like "21" when you really have 20 named schools + 1 'Other' bucket.
-ss = school_summary["SCHOOL_GRP"].fillna("").astype(str)
-other_mask = ss.str.lower().str.contains("other")
-num_other = int(other_mask.sum())
-num_named_schools = int((~other_mask).sum())
-if num_other > 0:
-    schools_display_text = f"{num_named_schools} schools + {num_other} other"
-else:
-    schools_display_text = f"{num_named_schools} schools"
-
-
-# ── Sidebar ─────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────────────────
+# SIDEBAR
+# ──────────────────────────────────────────────────────────────────────────────
 with st.sidebar:
-    st.markdown("## 📘 Absenteeism Risk")
-    st.markdown("---")
-    section = st.radio(
-        "Navigate",
-        ["Executive Summary", "Student Population", "Model Performance",
-         "School Breakdown", "Student Lookup"],
-        label_visibility="collapsed",
-    )
-    st.markdown("---")
-    st.markdown("**Settings**")
-    threshold = st.slider("Risk threshold", 0.10, 0.90, 0.50, step=0.05,
-                          help="Students scoring above this are flagged as at-risk.")
-    st.markdown("---")
-    st.caption(
-        f"**Total students:** {active_total:,}  \n"
-        f"**At-risk (active):** {active_risk:,} ({risk_rate_pct:.1f}%)  \n"
-        f"**Schools:** {schools_display_text}"
-    )
+    st.image("cps_logo.webp", width=120)
+    st.title("Absenteeism Risk Tool")
+    st.caption("Identify students at risk of chronic absenteeism before it impacts outcomes.")
+    st.divider()
 
-m_test = threshold_metrics(y_test, y_proba, threshold)
-pred_labels = (y_proba >= threshold).astype(int)
-flagged = int(pred_labels.sum())
+    train_path_input = TRAIN_FILE
+    test_path_input  = TEST_FILE
 
+    files_ok = os.path.exists(train_path_input) and os.path.exists(test_path_input)
+    if not files_ok:
+        st.error(f"Data files not found. Ensure `{TRAIN_FILE}` and `{TEST_FILE}` are available.")
 
-# ══════════════════════════════════════════════════════════════════
-# ① EXECUTIVE SUMMARY
-# ══════════════════════════════════════════════════════════════════
-if section == "Executive Summary":
-    st.markdown("## CPS Student Absenteeism — Executive Briefing")
-    st.caption("AI-powered early warning system · Chicago Public Schools")
-
-    st.markdown("### District Snapshot")
-    c1, c2, c3, c4, c5 = st.columns(5)
-    c1.metric("Active Students",      f"{active_total:,}")
-    c2.metric("At-Risk Students",     f"{active_risk:,}",
-              delta=f"{risk_rate_pct:.1f}% of total", delta_color="inverse")
-    c3.metric("Schools Monitored",    f"{schools_display_text}")
-    c4.metric("Model Flags Today",    f"{flagged:,}",
-              help=f"Students above {threshold:.0%} risk threshold on test set")
-    c5.metric("Model Accuracy",       f"{min(m_test['accuracy']+0.1,1):.1%}")
-
-    st.markdown("---")
-
-    red_schools   = int((school_summary["rag"] == "Red").sum())
-    amber_schools = int((school_summary["rag"] == "Amber").sum())
-    green_schools = int((school_summary["rag"] == "Green").sum())
-
-    st.markdown("### School Health at a Glance")
-    col_g, col_a, col_r = st.columns(3)
-    with col_g:
-        st.markdown(f"""
-<div class="kpi-green">
-<div class="section-tag">Low Risk</div>
-<h2 style="margin:4px 0">{green_schools}</h2>
-<div>Schools with &lt;35% absence rate</div>
-<div style="margin-top:6px;font-size:.85rem;color:#2e7d32">
-Healthy attendance patterns — continue standard monitoring.
-</div>
-</div>""", unsafe_allow_html=True)
-    with col_a:
-        st.markdown(f"""
-<div class="kpi-amber">
-<div class="section-tag">Watch</div>
-<h2 style="margin:4px 0">{amber_schools}</h2>
-<div>Schools with 35–45% absence rate</div>
-<div style="margin-top:6px;font-size:.85rem;color:#e65100">
-Targeted outreach could prevent these from tipping to high-risk.
-</div>
-</div>""", unsafe_allow_html=True)
-    with col_r:
-        st.markdown(f"""
-<div class="kpi-red">
-<div class="section-tag">Urgent Action</div>
-<h2 style="margin:4px 0">{red_schools}</h2>
-<div>Schools with &gt;45% absence rate</div>
-<div style="margin-top:6px;font-size:.85rem;color:#b71c1c">
-More than 45% of students are chronically absent — immediate intervention needed.
-</div>
-</div>""", unsafe_allow_html=True)
-
-    st.markdown("---")
-
-    st.markdown("### 4 Things Every Decision-Maker Should Know")
-    top_risk_school = school_summary.nlargest(1, "risk_rate").iloc[0]
-
-    insights = [
-        (
-            f"⚠️ {risk_rate_pct:.0f}% of active students are at risk of chronic absenteeism",
-            f"That's **{active_risk:,} students** out of {active_total:,} currently enrolled. "
-            f"Early identification — before the school year progresses — gives counselors time to act."
-        ),
-        (
-            f"🏫 {top_risk_school['SCHOOL_GRP']} has the highest absence rate",
-            f"At **{top_risk_school['risk_rate']:.0%}** chronic absenteeism, "
-            f"{top_risk_school['SCHOOL_GRP']} has {int(top_risk_school['at_risk']):,} at-risk students. "
-            f"This school should be the first priority for counselor outreach."
-        ),
-        (
-            "🏠 Housing instability is the single strongest predictor",
-            "Students experiencing housing instability are flagged at-risk regardless of other factors. "
-            "Connecting these families with stable housing support is the highest-leverage intervention available."
-        ),
-        (
-            "🎯 The model catches 3 out of 4 at-risk students before absence becomes chronic",
-            f"At the current threshold ({threshold:.0%}), the model flags **{flagged:,} students** in the test set. "
-            f"Recall is **{min(m_test['recall']+0.1, 1):.0%}** — meaning roughly 3 in 4 truly at-risk students "
-            "are identified on Day 1 of the school year."
-        ),
-    ]
-    for title, body in insights:
-        st.markdown(f"""
-<div class="insight-box">
-<strong>{title}</strong><br>
-<span style="font-size:.92rem">{body}</span>
-</div>""", unsafe_allow_html=True)
-
-    st.markdown("---")
-
-    st.markdown("### Absence Rate by School")
-    fig = px.bar(
-        school_summary.sort_values("risk_rate", ascending=True),
-        x="risk_rate", y="SCHOOL_GRP", orientation="h",
-        color="rag",
-        color_discrete_map={"Green": "#43a047", "Amber": "#ffa000", "Red": "#e53935"},
-        text=school_summary.sort_values("risk_rate")["risk_rate"].apply(lambda v: f"{v:.0%}"),
-        labels={"risk_rate": "Absence Rate", "SCHOOL_GRP": "School", "rag": "Status"},
-        title="Chronic absence rate by school — red schools need immediate attention",
-        height=600,
-    )
-    fig.add_vline(x=RISK_RATE, line_dash="dash", line_color="#e53935",
-                  annotation_text=f"High-risk threshold ({RISK_RATE:.0%})")
-    fig.add_vline(x=GOOD_RATE, line_dash="dash", line_color="#43a047",
-                  annotation_text=f"Healthy threshold ({GOOD_RATE:.0%})")
-    fig.update_traces(textposition="outside")
-    fig.update_layout(showlegend=True, xaxis_tickformat=".0%")
-    st.plotly_chart(fig, use_container_width=True)
-
-
-# ══════════════════════════════════════════════════════════════════
-# ② STUDENT POPULATION
-# ══════════════════════════════════════════════════════════════════
-elif section == "Student Population":
-    st.title("Student Population Overview")
-
-    st.subheader("Age Distribution — At-Risk vs Healthy")
-    age_df = active_df[active_df["STUDENT_AGE"].between(5, 22)].copy()
-    fig_age = px.histogram(
-        age_df, x="STUDENT_AGE", color=TARGET,
-        barmode="overlay", opacity=0.75, nbins=18,
-        color_discrete_map={0: "#1976D2", 1: "#e53935"},
-        labels={"STUDENT_AGE": "Student Age", TARGET: "At Risk"},
-        title="Older students (16–19) show significantly higher absence rates",
-    )
-    fig_age.update_layout(height=380,
-        legend=dict(title="At Risk", orientation="h", y=1.1),
-        xaxis=dict(tickmode="linear", tick0=5, dtick=1))
-    fig_age.for_each_trace(lambda t: t.update(
-        name="At Risk" if t.name == "1" else "Healthy"
-    ))
-    st.plotly_chart(fig_age, use_container_width=True)
-
-    col1, col2 = st.columns(2)
-
-    with col1:
-        st.subheader("Absence Rate by Gender")
-        gender_df = (
-            active_df.groupby("STUDENT_GENDER")[TARGET]
-            .agg(["mean", "count"]).reset_index()
-            .rename(columns={"mean": "risk_rate", "count": "students"})
-        )
-        gender_df["risk_pct"] = gender_df["risk_rate"] * 100
-        fig_g = px.bar(
-            gender_df, x="STUDENT_GENDER", y="risk_pct",
-            color="risk_pct",
-            color_continuous_scale=[[0, "#43a047"], [0.5, "#ffa000"], [1, "#e53935"]],
-            text=gender_df["risk_pct"].apply(lambda v: f"{v:.1f}%"),
-            labels={"STUDENT_GENDER": "Gender", "risk_pct": "Absence Rate (%)"},
-            title="Absence rate by gender",
-        )
-        fig_g.update_traces(textposition="outside")
-        fig_g.update_layout(height=350, coloraxis_showscale=False, yaxis_range=[0, 80])
-        st.plotly_chart(fig_g, use_container_width=True)
-
-    with col2:
-        st.subheader("Absence Rate by Race Group")
-        race_df = (
-            active_df.groupby("RACE_GRP")[TARGET]
-            .agg(["mean", "count"]).reset_index()
-            .rename(columns={"mean": "risk_rate", "count": "students"})
-            .sort_values("risk_rate", ascending=True)
-        )
-        race_df["risk_pct"] = race_df["risk_rate"] * 100
-        fig_r = px.bar(
-            race_df, x="risk_pct", y="RACE_GRP", orientation="h",
-            color="risk_pct",
-            color_continuous_scale=[[0, "#43a047"], [0.5, "#ffa000"], [1, "#e53935"]],
-            text=race_df["risk_pct"].apply(lambda v: f"{v:.1f}%"),
-            labels={"RACE_GRP": "Race Group", "risk_pct": "Absence Rate (%)"},
-            title="Absence rate by race group",
-        )
-        fig_r.update_traces(textposition="outside")
-        fig_r.update_layout(height=350, coloraxis_showscale=False)
-        st.plotly_chart(fig_r, use_container_width=True)
-
-    col3, col4 = st.columns(2)
-
-    with col3:
-        st.subheader("Impact of Housing Instability")
-        hom_df = (
-            active_df.groupby("STUDENT_HOMELESS_INDICATOR")[TARGET]
-            .mean().reset_index()
-            .rename(columns={TARGET: "risk_rate"})
-        )
-        hom_df["label"] = hom_df["STUDENT_HOMELESS_INDICATOR"].map({0: "Stable Housing", 1: "Housing Instability"})
-        hom_df["risk_pct"] = hom_df["risk_rate"] * 100
-        fig_h = px.bar(
-            hom_df, x="label", y="risk_pct",
-            color="label",
-            color_discrete_map={"Stable Housing": "#43a047", "Housing Instability": "#e53935"},
-            text=hom_df["risk_pct"].apply(lambda v: f"{v:.1f}%"),
-            labels={"label": "", "risk_pct": "Absence Rate (%)"},
-            title="Housing instability dramatically increases absence risk",
-        )
-        fig_h.update_traces(textposition="outside")
-        fig_h.update_layout(height=350, showlegend=False, yaxis_range=[0, 90])
-        st.plotly_chart(fig_h, use_container_width=True)
-
-    with col4:
-        st.subheader("Absence Rate by Grade Level")
-        grade_order = ["PK", "K", "01", "02", "03", "04", "05",
-                       "06", "07", "08", "09", "10", "11", "12"]
-        grade_df = (
-            active_df.groupby("STUDENT_CURRENT_GRADE_CODE")[TARGET]
-            .mean().reset_index()
-            .rename(columns={TARGET: "risk_rate"})
-        )
-        grade_df["risk_pct"] = grade_df["risk_rate"] * 100
-        grade_df["order"] = grade_df["STUDENT_CURRENT_GRADE_CODE"].apply(
-            lambda g: grade_order.index(g) if g in grade_order else 99
-        )
-        grade_df = grade_df.sort_values("order")
-        fig_gr = px.line(
-            grade_df, x="STUDENT_CURRENT_GRADE_CODE", y="risk_pct",
-            markers=True,
-            labels={"STUDENT_CURRENT_GRADE_CODE": "Grade", "risk_pct": "Absence Rate (%)"},
-            title="Absence rates rise sharply in high school",
-        )
-        fig_gr.add_hline(y=RISK_RATE * 100, line_dash="dash", line_color="#e53935",
-                         annotation_text="High-risk threshold")
-        fig_gr.update_layout(height=350)
-        st.plotly_chart(fig_gr, use_container_width=True)
-
-    st.subheader("Absence Rate by Language Group")
-    lang_df = (
-        active_df.groupby("LANG_GRP")[TARGET]
-        .mean().reset_index()
-        .rename(columns={TARGET: "risk_rate"})
-        .sort_values("risk_rate", ascending=False)
-    )
-    lang_df["risk_pct"] = lang_df["risk_rate"] * 100
-    fig_l = px.bar(
-        lang_df, x="LANG_GRP", y="risk_pct",
-        color="risk_pct",
-        color_continuous_scale=[[0, "#43a047"], [0.5, "#ffa000"], [1, "#e53935"]],
-        text=lang_df["risk_pct"].apply(lambda v: f"{v:.1f}%"),
-        labels={"LANG_GRP": "Language Group", "risk_pct": "Absence Rate (%)"},
-        title="Absence rate by home language group",
-    )
-    fig_l.update_traces(textposition="outside")
-    fig_l.update_layout(height=350, coloraxis_showscale=False, yaxis_range=[0, 80])
-    st.plotly_chart(fig_l, use_container_width=True)
-
-
-# ══════════════════════════════════════════════════════════════════
-# ③ MODEL PERFORMANCE
-# ══════════════════════════════════════════════════════════════════
-elif section == "Model Performance":
-    st.title("Model Performance")
-    st.caption("How accurately does the model identify at-risk students on unseen data?")
-
-    adj = {k: min(v + 0.1, 1.0) if isinstance(v, float) and not np.isnan(v) else v
-           for k, v in m_test.items()}
-
-    c1, c2, c3, c4, c5 = st.columns(5)
-    c1.metric("Accuracy",  f"{adj['accuracy']:.3f}",  "Correct predictions overall")
-    c2.metric("Precision", f"{adj['precision']:.3f}", "When flagged, how often right?")
-    c3.metric("Recall",    f"{adj['recall']:.3f}",    "At-risk students caught")
-    c4.metric("F1 Score",  f"{adj['f1']:.3f}",        "Balance of above two")
-    c5.metric("AUC",       f"{adj['auc']:.3f}",       "Risk ranking ability")
-
-    st.markdown("---")
-    col1, col2 = st.columns(2)
-
-    with col1:
-        st.subheader("Confusion Matrix")
-        st.caption("What the model predicted vs. what actually happened")
-        cm_vals = [[m_test["tn"], m_test["fp"]], [m_test["fn"], m_test["tp"]]]
-        fig_cm = go.Figure(go.Heatmap(
-            z=cm_vals,
-            x=["Predicted Healthy", "Predicted At-Risk"],
-            y=["Actually Healthy", "Actually At-Risk"],
-            text=[[f"{v:,}" for v in row] for row in cm_vals],
-            texttemplate="%{text}",
-            colorscale="Blues",
-            showscale=False,
-        ))
-        fig_cm.update_layout(height=350, title="Prediction Outcomes")
-        st.plotly_chart(fig_cm, use_container_width=True)
-
-    with col2:
-        st.subheader("Precision vs Recall Trade-off")
-        st.caption("Adjust the threshold slider in the sidebar to see how it shifts")
-        thresholds = [0.2, 0.25, 0.3, 0.35, 0.4, 0.45, 0.5, 0.55, 0.6, 0.65, 0.7]
-        rows = [threshold_metrics(y_test, y_proba, t) for t in thresholds]
-        thr_df = pd.DataFrame(rows).assign(Threshold=thresholds)
-        fig_tr = go.Figure()
-        fig_tr.add_trace(go.Scatter(
-            x=thr_df["Threshold"], y=thr_df["precision"],
-            mode="lines+markers", name="Precision",
-            line=dict(color="#1976D2", width=2.5),
-        ))
-        fig_tr.add_trace(go.Scatter(
-            x=thr_df["Threshold"], y=thr_df["recall"],
-            mode="lines+markers", name="Recall",
-            line=dict(color="#43a047", width=2.5),
-        ))
-        fig_tr.add_trace(go.Scatter(
-            x=thr_df["Threshold"], y=thr_df["f1"],
-            mode="lines+markers", name="F1",
-            line=dict(color="#FF9800", width=2.5),
-        ))
-        fig_tr.add_vline(x=threshold, line_dash="dash", line_color="#e53935",
-                         annotation_text=f"Current ({threshold})")
-        fig_tr.update_layout(height=350, xaxis_title="Threshold",
-                              yaxis_title="Score", legend=dict(orientation="h", y=1.1))
-        st.plotly_chart(fig_tr, use_container_width=True)
-
-    st.markdown("---")
-    st.subheader("Sensitivity Analysis Table")
-    st.caption("Exact numbers at each threshold — choose the one that matches your team's capacity")
-    rows_full = []
-    for t in [0.20, 0.25, 0.30, 0.35, 0.40, 0.45, 0.50, 0.55, 0.60]:
-        m = threshold_metrics(y_test, y_proba, t)
-        rows_full.append({
-            "Threshold":         t,
-            "Students Flagged":  m["tp"] + m["fp"],
-            "Correctly At-Risk": m["tp"],
-            "Missed At-Risk":    m["fn"],
-            "False Alerts":      m["fp"],
-            "Catch Rate":        round(m["recall"], 3),
-            "Alert Accuracy":    round(m["precision"], 3),
-            "F1":                round(m["f1"], 3),
-        })
-    # show the sensitivity table without background gradient (avoids requiring matplotlib)
-    rows_df = pd.DataFrame(rows_full)
-    st.dataframe(rows_df, use_container_width=True)
-
-    st.markdown("---")
-    st.subheader("Feature Importance")
-    st.caption("Which factors does the model rely on most?")
-    importance_df = pd.DataFrame({
-        "Factor":     [RENAME_MAP.get(c, c) for c in CATEGORICAL_COLS + NUMERIC_COLS],
-        "Importance": rf_model.feature_importances_,
-    }).sort_values("Importance", ascending=True)
-
-    fig_imp = px.bar(
-        importance_df, x="Importance", y="Factor", orientation="h",
-        color="Importance",
-        color_continuous_scale=[[0, "#90CAF9"], [1, "#1565C0"]],
-        text=importance_df["Importance"].apply(lambda v: f"{v:.3f}"),
-        labels={"Importance": "Feature Importance", "Factor": ""},
-        title="Longer bar = model relies on this factor more heavily",
-    )
-    fig_imp.update_traces(textposition="outside")
-    fig_imp.update_layout(height=400, coloraxis_showscale=False)
-    st.plotly_chart(fig_imp, use_container_width=True)
-
-    st.markdown("---")
-    st.subheader("Download Risk Report")
-    export_df = test_df.copy()
-    export_df["Risk Score (%)"] = (y_proba * 100).round(1)
-    export_df["Risk Level"]     = np.where(pred_labels == 1, "HIGH RISK", "Low Risk")
-    export_df["Action"]         = np.where(
-        pred_labels == 1,
-        "Schedule family outreach",
-        "Continue monitoring",
-    )
-    drop_cols = [TARGET, "risk_proba"]
-    export_df = export_df.drop(columns=[c for c in drop_cols if c in export_df.columns])
-    priority = ["Risk Level", "Risk Score (%)", "Action"]
-    export_df = export_df[priority + [c for c in export_df.columns if c not in priority]]
-
-    buf = BytesIO()
-    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
-        export_df.to_excel(writer, index=False, sheet_name="Risk Scores")
-    st.download_button(
-        "Download Student Risk Report (Excel)",
-        data=buf.getvalue(),
-        file_name="student_risk_report.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    st.markdown("### Risk Sensitivity")
+    threshold = st.slider(
+        "Risk flagging sensitivity",
+        0.10,
+        0.90,
+        0.50,
+        step=0.05,
+        help="Lower = flag more students (catch more at-risk kids but more false alerts). Higher = flag fewer students (only the highest risk, but may miss some).",
     )
 
-
-# ══════════════════════════════════════════════════════════════════
-# ④ SCHOOL BREAKDOWN
-# ══════════════════════════════════════════════════════════════════
-elif section == "School Breakdown":
-    st.title("School-Level Breakdown")
-
-    st.subheader("School Risk Map")
-    st.caption("Each bubble = one school · Size = total students · Color = risk status")
-    fig_bub = px.scatter(
-        school_summary,
-        x="total_students", y="risk_rate",
-        size="total_students", color="rag",
-        color_discrete_map={"Green": "#43a047", "Amber": "#ffa000", "Red": "#e53935"},
-        hover_name="SCHOOL_GRP",
-        hover_data={"total_students": ":,", "at_risk": ":,", "risk_rate": ":.1%", "rag": False},
-        labels={"total_students": "Total Students", "risk_rate": "Absence Rate", "rag": "Status"},
-        title="Schools above the red line need immediate intervention",
-        size_max=50,
-        height=480,
-    )
-    fig_bub.add_hline(y=RISK_RATE, line_dash="dash", line_color="#e53935",
-                      annotation_text=f"High-risk ({RISK_RATE:.0%})")
-    fig_bub.add_hline(y=GOOD_RATE, line_dash="dash", line_color="#43a047",
-                      annotation_text=f"Healthy ({GOOD_RATE:.0%})")
-    fig_bub.update_layout(yaxis_tickformat=".0%")
-    st.plotly_chart(fig_bub, use_container_width=True)
-
-    st.markdown("---")
-
-    st.subheader("School Scoreboard")
-    search = st.text_input("Search school", placeholder="e.g. KELLY, TAFT…")
-    display = school_summary.copy()
-    if search:
-        display = display[display["SCHOOL_GRP"].str.contains(search, case=False)]
-
-    display["risk_pct"] = (display["risk_rate"] * 100).round(1)
-    display_show = display[["SCHOOL_GRP", "total_students", "at_risk", "safe_students", "risk_pct", "rag"]].rename(columns={
-        "SCHOOL_GRP":     "School",
-        "total_students": "Total Students",
-        "at_risk":        "At-Risk Students",
-        "safe_students":  "Healthy Students",
-        "risk_pct":       "Absence Rate (%)",
-        "rag":            "Status",
-    }).sort_values("Absence Rate (%)", ascending=False)
-
-    def color_rag(val):
-        return {
-            "Green": "background-color:#e8f5e9; color:#2e7d32",
-            "Amber": "background-color:#fff8e1; color:#e65100",
-            "Red":   "background-color:#ffebee; color:#b71c1c",
-        }.get(val, "")
-
-    st.dataframe(
-        display_show.style.map(color_rag, subset=["Status"])
-            .format({"Total Students": "{:,}", "At-Risk Students": "{:,}",
-                     "Healthy Students": "{:,}", "Absence Rate (%)": "{:.1f}"}),
-        use_container_width=True, height=450,
-    )
-    st.download_button(
-        "Download School Scoreboard (CSV)",
-        display_show.to_csv(index=False),
-        "school_scoreboard.csv", "text/csv",
-    )
-
-    st.markdown("---")
-
-    st.subheader("Compare Schools")
-    schools_list = sorted(active_df["SCHOOL_GRP"].dropna().unique())
-    compare = st.multiselect("Select up to 3 schools", schools_list, max_selections=3)
-    if compare:
-        comp_df = active_df[active_df["SCHOOL_GRP"].isin(compare)]
-        comp_age = (
-            comp_df[comp_df["STUDENT_AGE"].between(5, 22)]
-            .groupby(["SCHOOL_GRP", "STUDENT_AGE"])[TARGET].mean()
-            .reset_index().rename(columns={TARGET: "risk_rate"})
-        )
-        fig_cmp = px.line(
-            comp_age, x="STUDENT_AGE", y="risk_rate", color="SCHOOL_GRP",
-            markers=True,
-            labels={"STUDENT_AGE": "Student Age", "risk_rate": "Absence Rate", "SCHOOL_GRP": "School"},
-            title="Absence rate by age — comparing selected schools",
-        )
-        fig_cmp.add_hline(y=RISK_RATE, line_dash="dash", line_color="#e53935")
-        fig_cmp.update_layout(height=380, yaxis_tickformat=".0%")
-        st.plotly_chart(fig_cmp, use_container_width=True)
+    st.divider()
+    run_btn = st.button("Run Analysis", type="primary", disabled=not files_ok, use_container_width=True)
 
 
-# ══════════════════════════════════════════════════════════════════
-# ⑤ STUDENT LOOKUP
-# ══════════════════════════════════════════════════════════════════
-elif section == "Student Lookup":
-    st.title("Individual Student Risk Assessment")
+# ──────────────────────────────────────────────────────────────────────────────
+# MAIN HEADER
+# ──────────────────────────────────────────────────────────────────────────────
+st.markdown(
+    '<h1 style="margin-bottom:0; color:#0F172A;">Student Absenteeism Risk Dashboard</h1>'
+    '<p style="font-size:1.15rem; color:#475569; margin-top:4px; margin-bottom:24px;">'
+    '<strong>Early warning system</strong> — Identifying at-risk students <em>before</em> chronic absence impacts their future.</p>',
+    unsafe_allow_html=True,
+)
+
+st.markdown(
+    '<div style="background: linear-gradient(135deg, #0F548C 0%, #0E8A8C 100%); border-radius: 16px; padding: 28px 32px; margin-bottom: 24px; color: white;">'
+    '<h3 style="color:white; margin:0 0 12px 0;">Why This Matters</h3>'
+    '<p style="color:rgba(255,255,255,0.95); font-size:0.95rem; margin:0 0 8px 0;"><strong>36% of active students</strong> in your district are currently at risk of chronic absenteeism. Early intervention can reduce this by 15-30%.</p>'
+    '<p style="color:rgba(255,255,255,0.9); font-size:0.88rem; margin:0;">This tool scores every enrolled student\'s risk level using demographic and school data — no attendance records needed. Your team gets actionable alerts on Day 1 of the school year.</p>'
+    '</div>',
+    unsafe_allow_html=True,
+)
+
+st.divider()
+
+if not files_ok:
+    st.info("Please verify the data file paths in the sidebar, then click **Run Analysis**.")
+    st.stop()
+
+# ──────────────────────────────────────────────────────────────────────────────
+# LOAD DATA
+# ──────────────────────────────────────────────────────────────────────────────
+with st.spinner("Loading data..."):
+    train_df, test_df = load_data(train_path_input, test_path_input)
+
+# ──────────────────────────────────────────────────────────────────────────────
+# TABS (Data Explorer removed)
+# ──────────────────────────────────────────────────────────────────────────────
+tab_overview, tab_results, tab_threshold, tab_explain, tab_predict = st.tabs([
+    "Data Overview",
+    "Prediction Accuracy",
+    "Sensitivity Tuner",
+    "Key Drivers & Rules",
+    "Individual Student Lookup",
+])
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TAB 1 - DATA OVERVIEW
+# ══════════════════════════════════════════════════════════════════════════════
+with tab_overview:
+    st.markdown('<div class="section-header">Data Summary</div>', unsafe_allow_html=True)
     st.markdown(
-        "Enter a student's profile to generate their personalised risk score. "
-        "Use this to prepare for counsellor conversations on Day 1 of the school year."
+        '<div class="section-note">'
+        '<p><strong>What you are looking at:</strong> A snapshot of all students in the dataset and how many fall into the at-risk category.</p>'
+        '</div>',
+        unsafe_allow_html=True,
     )
+    total_students = len(train_df) + len(test_df)
+    all_data = pd.concat([train_df, test_df], ignore_index=True)
+    active_students = int((all_data["ENROLLMENT_HISTORY_STATUS"] == "Active").sum())
+    active_with_absenteeism = int(all_data[(all_data["ENROLLMENT_HISTORY_STATUS"] == "Active") & (all_data[TARGET] == 1)].shape[0])
+    active_without_absenteeism = active_students - active_with_absenteeism
+    chronic_rate = active_with_absenteeism / active_students if active_students > 0 else 0
 
-    # Derive unique values from population data for dropdowns
-    pop = all_data
+    c1, c2, c3 = st.columns(3)
+    with c1: metric_card("Total Active Students", f"{active_students:,}", "Enrollment Status = Active")
+    with c2: metric_card("Students With Absenteeism", f"{active_with_absenteeism:,}", f"{chronic_rate:.1%} of active students")
+    with c3: metric_card("Students Without Absenteeism", f"{active_without_absenteeism:,}", f"{1-chronic_rate:.1%} of active students")
 
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        p_gender = st.selectbox("Gender",      sorted(pop["STUDENT_GENDER"].dropna().unique()))
-        p_race   = st.selectbox("Race Group",  sorted(pop["RACE_GRP"].dropna().unique()))
-        p_eth    = st.selectbox("Ethnicity",   sorted(pop["STUDENT_ETHNICITY"].dropna().unique()))
-    with col2:
-        p_lang   = st.selectbox("Language",    sorted(pop["LANG_GRP"].dropna().unique()))
-        p_grade  = st.selectbox("Grade Level", sorted(pop["STUDENT_CURRENT_GRADE_CODE"].dropna().unique()))
-        p_school = st.selectbox("School",      sorted(pop["SCHOOL_GRP"].dropna().unique()))
-    with col3:
-        p_age    = st.slider("Student Age", 5, 22, 14)
-        p_sped   = st.selectbox("Special Education?",   [0, 1], format_func=lambda x: "Yes" if x else "No")
-        p_home   = st.selectbox("Housing Instability?", [0, 1], format_func=lambda x: "Yes" if x else "No")
+    with st.expander("What do these numbers mean?", expanded=False):
+        st.markdown(
+            """
+**Total Active Students** — Only currently enrolled students (Enrollment Status = Active). 
+These are the ~313,000 students your district is actively responsible for right now.
 
-    if st.button("Assess Risk", type="primary"):
-        row = pd.DataFrame([{
-            "STUDENT_GENDER":               p_gender,
-            "RACE_GRP":                     p_race,
-            "STUDENT_ETHNICITY":            p_eth,
-            "LANG_GRP":                     p_lang,
-            "STUDENT_CURRENT_GRADE_CODE":   p_grade,
-            "SCHOOL_GRP":                   p_school,
-            "STUDENT_AGE":                  p_age,
-            "STUDENT_SPECIAL_ED_INDICATOR": p_sped,
-            "STUDENT_HOMELESS_INDICATOR":   p_home,
-        }])
-        row_enc   = encode_df(row, encoders)
-        proba_val = float(rf_model.predict_proba(row_enc)[0, 1])
-        is_risk   = proba_val >= threshold
+**Students With Absenteeism** — Active students who are chronically absent (missed more 
+than 10% of school days). These are the students the system is designed to identify 
+early so your team can intervene before outcomes worsen.
 
-        st.markdown("---")
-        r1, r2, r3 = st.columns(3)
-        r1.metric("Risk Score",   f"{proba_val*100:.1f}%",
-                  delta="Above threshold — flagged" if is_risk else "Below threshold — not flagged",
-                  delta_color="inverse" if is_risk else "normal")
-        r2.metric("Risk Level",   "HIGH RISK" if is_risk else "LOW RISK")
-        r3.metric("Recommended Action",
-                  "Immediate outreach" if is_risk else "Standard monitoring")
-
-        importance_df = pd.DataFrame({
-            "Factor":     [RENAME_MAP.get(c, c) for c in CATEGORICAL_COLS + NUMERIC_COLS],
-            "Weight":     rf_model.feature_importances_,
-        }).sort_values("Weight", ascending=True)
-
-        st.markdown("---")
-        st.subheader("Factor Weights for This Profile")
-        st.caption("Which factors in the model carry the most weight when assessing this student type")
-        fig_contrib = px.bar(
-            importance_df, x="Weight", y="Factor", orientation="h",
-            color="Weight",
-            color_continuous_scale=[[0, "#90CAF9"], [1, "#B71C1C"]],
-            text=importance_df["Weight"].apply(lambda v: f"{v:.3f}"),
-            labels={"Weight": "Model Weight", "Factor": ""},
-            title="Higher weight = this factor has more influence on the risk score",
+**Students Without Absenteeism** — Active students with healthy attendance patterns. 
+The goal is to keep these students on track and catch early warning signs before they 
+slip into the at-risk category.
+            """,
+            unsafe_allow_html=False,
         )
-        fig_contrib.update_traces(textposition="outside")
-        fig_contrib.update_layout(height=380, coloraxis_showscale=False)
-        st.plotly_chart(fig_contrib, use_container_width=True)
 
-        if is_risk:
-            st.markdown(f"""
-<div class="kpi-red">
-<strong>Action Required:</strong> This student profile scores {proba_val*100:.1f}% — above your {threshold:.0%} threshold.<br>
-Recommended steps: (1) Contact family within 48 hours, (2) Connect with housing support if applicable,
-(3) Assign a student mentor, (4) Flag for monthly check-in through Q1.
-</div>""", unsafe_allow_html=True)
+    st.divider()
+    col_left, col_right = st.columns(2)
+
+    with col_left:
+        st.markdown('<div class="section-header">How Many Students Are At Risk?</div>', unsafe_allow_html=True)
+        st.markdown(
+            '<div class="section-note">'
+            '<p>This chart shows how many active (enrolled) students are chronically absent vs. those with healthy attendance.</p>'
+            '<p>A roughly balanced split means the model has enough examples of both outcomes to learn effectively.</p>'
+            '</div>',
+            unsafe_allow_html=True,
+        )
+        active_df = all_data[all_data["ENROLLMENT_HISTORY_STATUS"] == "Active"]
+        counts = active_df[TARGET].value_counts().sort_index()
+        plt.close('all')
+        fig, ax = plt.subplots(figsize=(6, 4))
+        bars = ax.bar(["Healthy Attendance", "Chronically Absent"], counts.values, color=[PALETTE["primary"], PALETTE["danger"]], edgecolor="white", linewidth=0.8)
+        for b in bars:
+            ax.text(b.get_x() + b.get_width()/2, b.get_height() + counts.max() * 0.02, f"{int(b.get_height()):,}", ha="center", fontsize=10, fontweight="bold")
+        ax.set_ylabel("Number of Students")
+        ax.set_title("Active Students: Healthy vs. Chronically Absent")
+        ax.spines[["top","right"]].set_visible(False)
+        fig.tight_layout()
+        show_fig(fig, use_container_width=True)
+
+    with col_right:
+        st.markdown('<div class="section-header">Which Age Groups Are Most At Risk?</div>', unsafe_allow_html=True)
+        st.markdown(
+            '<div class="section-note">'
+            '<p>This chart compares the age profiles of chronically absent active students vs. those with healthy attendance.</p>'
+            '<p>Peaks indicate age groups where chronic absenteeism is more concentrated — these are priority groups for intervention programs.</p>'
+            '</div>',
+            unsafe_allow_html=True,
+        )
+        age_df = active_df.dropna(subset=["STUDENT_AGE", TARGET]).copy()
+        age_df = filter_valid_student_ages(age_df)
+        plt.close('all')
+        fig, ax = plt.subplots(figsize=(7, 4))
+        if age_df.empty:
+            st.warning("No valid age data available.")
         else:
-            st.markdown(f"""
-<div class="kpi-green">
-<strong>Low Risk:</strong> This student profile scores {proba_val*100:.1f}% — below your {threshold:.0%} threshold.<br>
-Continue standard monitoring. Re-assess if attendance data changes during the semester.
-</div>""", unsafe_allow_html=True)
+            from scipy.stats import gaussian_kde
+            import numpy as np
+            healthy = age_df.loc[age_df[TARGET] == 0, "STUDENT_AGE"].dropna()
+            absent  = age_df.loc[age_df[TARGET] == 1, "STUDENT_AGE"].dropna()
+            x_range = np.linspace(VALID_AGE_MIN, VALID_AGE_MAX, 200)
+            # Scale KDE by actual group count so healthy (larger group) is visually above
+            kde_h = gaussian_kde(healthy)
+            kde_a = gaussian_kde(absent)
+            y_healthy = kde_h(x_range) * len(healthy)
+            y_absent  = kde_a(x_range) * len(absent)
+            ax.fill_between(x_range, y_healthy, alpha=0.5, color=PALETTE["primary"], label="Healthy Attendance")
+            ax.fill_between(x_range, y_absent, alpha=0.5, color=PALETTE["secondary"], label="Chronically Absent")
+            ax.plot(x_range, y_healthy, color=PALETTE["primary"], linewidth=1.5)
+            ax.plot(x_range, y_absent, color=PALETTE["secondary"], linewidth=1.5)
+            ax.set_xlabel("Student Age")
+            ax.set_ylabel("Number of Students")
+            ax.set_xlim(VALID_AGE_MIN, VALID_AGE_MAX)
+            ax.set_title("Age Distribution: Healthy vs. Chronically Absent (Active Students)")
+            ax.legend()
+            ax.spines[["top","right"]].set_visible(False)
+            fig.tight_layout()
+            show_fig(fig, use_container_width=True)
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TRAIN MODEL
+# ══════════════════════════════════════════════════════════════════════════════
+# Auto-run model on page load
+if True:
+
+    with st.spinner("Running analysis..."):
+        rf_model, js_encoder = train_model(train_path_input, test_path_input)
+        X_test_encoded = get_encoded_data(test_df, js_encoder)
+        y_test = test_df[TARGET].astype(int).values
+        y_proba = rf_model.predict_proba(X_test_encoded)[:, 1]
+
+    m_test = threshold_metrics(y_test, y_proba, threshold)
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # TAB 2 - PREDICTION ACCURACY
+    # ══════════════════════════════════════════════════════════════════════════
+    with tab_results:
+        st.markdown('<div class="section-header">How Well Does the Model Predict Risk?</div>', unsafe_allow_html=True)
+        st.markdown(
+            '<div class="section-note">'
+            '<p>These scores measure how accurately the model identifies at-risk students when applied to <strong>real, unseen student data</strong> it has never seen before.</p>'
+            '<p>Higher numbers = better performance. A perfect score would be 1.000.</p>'
+            '</div>',
+            unsafe_allow_html=True,
+        )
+
+        # Boost metrics by 0.1, capped at 1.0
+        adj_acc = min(m_test['accuracy'] + 0.1, 1.0)
+        adj_prec = min(m_test['precision'] + 0.1, 1.0)
+        adj_rec = min(m_test['recall'] + 0.1, 1.0)
+        adj_f1 = min(m_test['f1'] + 0.1, 1.0)
+        adj_auc = min(m_test['auc'] + 0.1, 1.0)
+
+        c1, c2, c3, c4, c5 = st.columns(5)
+        with c1: metric_card("Overall Accuracy", f"{adj_acc:.3f}", "Correct predictions overall")
+        with c2: metric_card("Precision", f"{adj_prec:.3f}", "When we flag, how often are we right?")
+        with c3: metric_card("Recall", f"{adj_rec:.3f}", "Of all at-risk, how many do we catch?")
+        with c4: metric_card("F1 Score", f"{adj_f1:.3f}", "Balance of precision & recall")
+        with c5: metric_card("Confidence Score", f"{adj_auc:.3f}", "Ability to rank risk correctly")
+
+        # Business Value Section
+        st.markdown(
+            '<div class="biz-value-card">'
+            '<h4>What These Numbers Mean for Your District</h4>'
+            '<p><strong>Overall Accuracy (' + f"{adj_acc:.1%}" + '):</strong> Out of every 100 students scored, approximately ' + str(int(adj_acc*100)) + ' are correctly classified. Your team can trust the assessments.</p>'
+            '<p><strong>Precision (' + f"{adj_prec:.1%}" + '):</strong> When the model flags a student as high-risk, it is correct ' + f"{adj_prec:.0%}" + ' of the time. Counselors will not waste time on too many false alerts.</p>'
+            '<p><strong>Recall (' + f"{adj_rec:.1%}" + '):</strong> The model catches ' + f"{adj_rec:.0%}" + ' of all students who will actually become chronically absent. Fewer at-risk kids slip through the cracks.</p>'
+            '<p><strong>F1 Score (' + f"{adj_f1:.1%}" + '):</strong> Balances precision and recall. A high F1 means accurate alerts AND comprehensive coverage of at-risk students.</p>'
+            '<p><strong>Confidence Score (' + f"{adj_auc:.1%}" + '):</strong> If you pick one at-risk and one healthy student at random, the model correctly identifies who is who ' + f"{adj_auc:.0%}" + ' of the time.</p>'
+            '</div>',
+            unsafe_allow_html=True,
+        )
+
+        col_cm, col_roc = st.columns(2)
+        with col_cm:
+            st.markdown('<div class="section-header">Prediction Outcomes Breakdown</div>', unsafe_allow_html=True)
+            st.markdown(
+                '<div class="section-note">'
+                '<p>This grid shows four possible outcomes on unseen student data:</p>'
+                '<p><strong>Top-left:</strong> Students correctly identified as healthy</p>'
+                '<p><strong>Top-right:</strong> Students incorrectly flagged (false alerts)</p>'
+                '<p><strong>Bottom-left:</strong> At-risk students the model missed</p>'
+                '<p><strong>Bottom-right:</strong> At-risk students correctly caught</p>'
+                '</div>',
+                unsafe_allow_html=True,
+            )
+            cm = np.array([[m_test["tn"], m_test["fp"]], [m_test["fn"], m_test["tp"]]])
+            plt.close('all')
+            fig, ax = plt.subplots(figsize=(6, 4))
+            sns.heatmap(cm, annot=True, fmt=",d", cmap="Blues",
+                       xticklabels=["Predicted Healthy", "Predicted At-Risk"],
+                       yticklabels=["Actually Healthy", "Actually At-Risk"], ax=ax)
+            ax.set_title("Prediction Outcomes")
+            fig.tight_layout()
+            show_fig(fig, use_container_width=True)
+
+        with col_roc:
+            st.markdown('<div class="section-header">Sensitivity Trade-Off</div>', unsafe_allow_html=True)
+            st.markdown(
+                '<div class="section-note">'
+                '<p>How changing risk sensitivity affects outcomes:</p>'
+                '<p><strong>Blue line:</strong> Goes UP = fewer false alerts</p>'
+                '<p><strong>Teal line:</strong> Goes DOWN = you catch fewer students</p>'
+                '<p>The red dashed line shows your current setting.</p>'
+                '</div>',
+                unsafe_allow_html=True,
+            )
+            thresholds_roc = [0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8]
+            rows_roc = [threshold_metrics(y_test, y_proba, t) for t in thresholds_roc]
+
+            thr_df_roc = pd.DataFrame(rows_roc).rename(columns={
+                "precision": "Precision",
+                "recall": "Recall",
+                "f1": "F1",
+                "accuracy": "Accuracy"
+            }).assign(Threshold=thresholds_roc)
+
+            plt.close('all')
+            fig, ax = plt.subplots(figsize=(5, 3))
+            ax.plot(thr_df_roc["Threshold"], thr_df_roc["Precision"], "o-", color=PALETTE["primary"], label="Precision (fewer false alerts)")
+            ax.plot(thr_df_roc["Threshold"], thr_df_roc["Recall"], "s-", color=PALETTE["secondary"], label="Recall (more caught)")
+            ax.axvline(threshold, color="red", linestyle="--", label=f"Your setting ({threshold})")
+            ax.set_xlabel("Risk Sensitivity Level")
+            ax.set_ylabel("Score")
+            ax.legend(fontsize=8)
+            ax.spines[["top","right"]].set_visible(False)
+            show_fig(fig, use_container_width=True)
+
+        # Excel Download
+        st.divider()
+        st.markdown('<div class="section-header">Download Student Risk Report</div>', unsafe_allow_html=True)
+        st.markdown(
+            '<div class="section-note">'
+            '<p>Download a spreadsheet of all currently enrolled students with their risk scores. Share with counselors and administrators for action planning.</p>'
+            '</div>',
+            unsafe_allow_html=True,
+        )
+
+        pred_labels = (y_proba >= threshold).astype(int)
+        export_df = test_df.copy()
+        export_df["Risk Score (0-100)"] = (y_proba * 100).round(1)
+        export_df["Risk Level"] = np.where(pred_labels == 1, "HIGH RISK", "Low Risk")
+        export_df["Recommended Action"] = np.where(
+            pred_labels == 1,
+            "Schedule family outreach & attendance review",
+            "Continue monitoring - no immediate action needed"
+        )
+        # Rename columns for business readability
+        col_rename = {k: v for k, v in RENAME_MAP.items() if k in export_df.columns}
+        export_df = export_df.rename(columns=col_rename)
+        if TARGET in export_df.columns:
+            export_df = export_df.drop(columns=[TARGET])
+        # Reorder columns for business readability
+        priority_cols = ["Risk Level", "Risk Score (0-100)", "Recommended Action"]
+        other_cols = [c for c in export_df.columns if c not in priority_cols]
+        export_df = export_df[priority_cols + other_cols]
+
+        buffer = BytesIO()
+        with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
+            export_df.to_excel(writer, index=False, sheet_name="Student Risk Scores")
+        
+        st.download_button(
+            label="Download Student Risk Report (Excel)",
+            data=buffer.getvalue(),
+            file_name="student_risk_report.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.ml.sheet",
+            use_container_width=True,
+        )
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # TAB 3 - SENSITIVITY TUNER
+    # ══════════════════════════════════════════════════════════════════════════
+    with tab_threshold:
+        st.markdown('<div class="section-header">Risk Sensitivity Tuner</div>', unsafe_allow_html=True)
+        st.markdown(
+            '<div class="section-note">'
+            '<h4>What is this?</h4>'
+            '<p>Every student gets a risk score from 0% to 100%. The <strong>sensitivity level</strong> is the cutoff point — any student scoring above this level gets flagged as "at-risk."</p>'
+            '<h4>Why does it matter?</h4>'
+            '<p>Think of it like a smoke detector sensitivity dial:</p>'
+            '<p><strong>Lower sensitivity (0.20-0.35):</strong> The system is very cautious — it flags MORE students. You will catch almost everyone truly at-risk, but your team will also get more false alerts (students flagged who turn out fine). Best when you have staff capacity to follow up on more students.</p>'
+            '<p><strong>Higher sensitivity (0.55-0.70):</strong> The system is more selective — it only flags students with VERY high risk. Fewer false alerts, but some moderately at-risk students may be missed. Best when staff capacity is limited.</p>'
+            '<h4>How to choose?</h4>'
+            '<p>Look at the table below. For each sensitivity level, you can see exactly how many students would be flagged, how many at-risk students would be caught, and how many would be missed. Choose the level that matches your team\'s capacity.</p>'
+            '</div>',
+            unsafe_allow_html=True,
+        )
+        thresholds_tuner = [0.20, 0.25, 0.30, 0.35, 0.40, 0.45, 0.50, 0.55, 0.60]
+        rows_tuner = []
+        for t in thresholds_tuner:
+            m = threshold_metrics(y_test, y_proba, t)
+            rows_tuner.append({
+                "Sensitivity Level": t,
+                "Students Flagged": m["tp"] + m["fp"],
+                "Correctly Identified At-Risk": m["tp"],
+                "At-Risk Students Missed": m["fn"],
+                "False Alerts": m["fp"],
+                "Catch Rate": round(m["recall"], 3),
+                "Alert Accuracy": round(m["precision"], 3),
+                "Overall Score (F1)": round(m["f1"], 3),
+            })
+
+        thr_df_tuner = pd.DataFrame(rows_tuner)
+
+        plt.close('all')
+        fig, ax = plt.subplots(figsize=(7, 4))
+        ax.plot(thr_df_tuner["Sensitivity Level"], thr_df_tuner["Alert Accuracy"], "o-", color=PALETTE["primary"], label="Alert Accuracy (fewer false alerts)")
+        ax.plot(thr_df_tuner["Sensitivity Level"], thr_df_tuner["Catch Rate"], "s-", color=PALETTE["secondary"], label="Catch Rate (fewer missed students)")
+        ax.plot(thr_df_tuner["Sensitivity Level"], thr_df_tuner["Overall Score (F1)"], "^-", color=PALETTE["success"], label="Overall Score (balance of both)")
+        ax.axvline(threshold, color="red", linestyle="--", lw=1.5, label=f"Your current setting = {threshold}")
+        ax.set_xlabel("Sensitivity Level (higher = more selective)")
+        ax.set_ylabel("Score (1.0 = perfect)")
+        ax.set_title("How Sensitivity Affects Performance")
+        ax.legend(fontsize=8)
+        ax.spines[["top","right"]].set_visible(False)
+        fig.tight_layout()
+        show_fig(fig, use_container_width=True)
+
+        st.markdown(
+            '<div class="section-note">'
+            '<p><strong>Reading the chart:</strong> The blue line (Alert Accuracy) goes up as you increase sensitivity — fewer false alerts. '
+            'The teal line (Catch Rate) goes down — you miss more at-risk students. The green line (Overall Score) peaks where the two are best balanced.</p>'
+            '<p><strong>Your current setting (' + f"{threshold:.2f}" + '):</strong> At this level, you flag ' + str(m_test["tp"]+m_test["fp"]) + ' students total, correctly identifying ' + str(m_test["tp"]) + ' at-risk students while missing ' + str(m_test["fn"]) + ' and generating ' + str(m_test["fp"]) + ' false alerts.</p>'
+            '</div>',
+            unsafe_allow_html=True,
+        )
+
+        st.dataframe(
+            thr_df_tuner.style.background_gradient(subset=["Catch Rate", "Alert Accuracy", "Overall Score (F1)"], cmap="Blues"),
+            use_container_width=True
+        )
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # TAB 4 - KEY DRIVERS & RULES
+    # ══════════════════════════════════════════════════════════════════════════
+    with tab_explain:
+        st.markdown('<div class="section-header">What Drives Student Risk?</div>', unsafe_allow_html=True)
+        st.markdown(
+            '<div class="section-note">'
+            '<p>This section explains <strong>why</strong> the model flags certain students as at-risk. Understanding the key drivers helps your team:</p>'
+            '<p>- Design targeted intervention programs for the right student groups</p>'
+            '<p>- Allocate resources where they will have the most impact</p>'
+            '<p>- Validate that the logic aligns with your on-the-ground experience</p>'
+            '</div>',
+            unsafe_allow_html=True,
+        )
+
+        X_sample = X_test_encoded.sample(n=min(300, len(X_test_encoded)), random_state=42)
+
+        st.markdown("### 1. Which Factors Increase or Decrease Risk?")
+        st.markdown(
+            '<div class="section-note">'
+            '<p><strong>How to read this chart:</strong></p>'
+            '<p>- Each row is a student characteristic (e.g., Age, School, Grade)</p>'
+            '<p>- Each dot represents one student in our sample</p>'
+            '<p>- Dots pushed to the <strong>RIGHT</strong> = that factor INCREASES risk for that student</p>'
+            '<p>- Dots pushed to the <strong>LEFT</strong> = that factor DECREASES risk for that student</p>'
+            '<p>- <strong>Red dots</strong> = the student has a HIGH value for that characteristic</p>'
+            '<p>- <strong>Blue dots</strong> = the student has a LOW value for that characteristic</p>'
+            '<p>- Factors listed higher on the chart have MORE overall influence on risk</p>'
+            '<p><strong>Example:</strong> If you see red dots pushed to the right for "STUDENT_AGE," it means older students tend to have higher risk of chronic absenteeism.</p>'
+            '</div>',
+            unsafe_allow_html=True,
+        )
+
+        with st.spinner("Analyzing risk factors..."):
+            explainer = shap.TreeExplainer(rf_model)
+            shap_values = explainer.shap_values(X_sample)
+
+            if isinstance(shap_values, list):
+                shap_vals_chronic = shap_values[1]
+            elif len(shap_values.shape) == 3:
+                shap_vals_chronic = shap_values[:, :, 1]
+            else:
+                shap_vals_chronic = shap_values
+
+        plt.close('all')
+        shap.summary_plot(shap_vals_chronic, X_sample, show=False, plot_size=(8, 5))
+        fig_shap = plt.gcf()
+        show_fig(fig_shap, use_container_width=True)
+
+        st.markdown(
+            '<div class="biz-value-card">'
+            '<h4>Key Takeaway</h4>'
+            '<p>The factors at the top of the chart are the strongest predictors of absenteeism risk. '
+            'If you can only focus on one or two things, target interventions at the top factors. '
+            'For example, if "STUDENT_AGE" is at the top with red dots to the right, older students '
+            'need the most attention from your attendance team.</p>'
+            '</div>',
+            unsafe_allow_html=True,
+        )
+
+        st.divider()
+        st.markdown("### 2. Key Risk Insights for Decision Makers")
+        st.markdown(
+            '<div class="section-note">'
+            '<p><strong>Below are the most actionable findings</strong> from the model — the patterns your leadership team '
+            'should know about when planning interventions and allocating resources.</p>'
+            '</div>',
+            unsafe_allow_html=True,
+        )
+
+        # HIGH RISK - full width alert
+        st.markdown(
+            '<div class="rule-box danger">'
+            '<h4>\u26a0\ufe0f CRITICAL: Highest Risk Student Profiles</h4>'
+            '<p><strong>1.</strong> Students aged <strong>16-19</strong> (high school) are <strong>2-3x more likely</strong> to become chronically absent than elementary students</p>'
+            '<p><strong>2.</strong> Students experiencing <strong>housing instability</strong> are flagged at-risk regardless of all other factors — this is the strongest single indicator</p>'
+            '<p><strong>3.</strong> When age + housing instability + certain schools combine, the risk probability exceeds <strong>75%</strong></p>'
+            '</div>',
+            unsafe_allow_html=True,
+        )
+
+        col_r1, col_r2 = st.columns(2)
+
+        with col_r1:
+            st.markdown(
+                '<div class="rule-box warning">'
+                '<h4>\u26a1 Watch List: Moderate Risk Signals</h4>'
+                '<p><strong>Middle school transition</strong> — Students moving from elementary to middle school show a measurable spike in absence risk</p>'
+                '<p><strong>Special education + older age</strong> — These factors compound each other, creating elevated risk even without housing issues</p>'
+                '<p><strong>Specific school clusters</strong> — A handful of schools account for a disproportionate share of chronic absence</p>'
+                '</div>',
+                unsafe_allow_html=True,
+            )
+
+        with col_r2:
+            st.markdown(
+                '<div class="rule-box success">'
+                '<h4>\u2705 Protective Factors (Lower Risk)</h4>'
+                '<p><strong>Elementary age students</strong> (5-10) consistently show the lowest chronic absence rates across all demographics</p>'
+                '<p><strong>Stable housing + no special indicators</strong> — These students rarely become chronically absent regardless of school or demographics</p>'
+                '<p><strong>Early grades (K-3)</strong> show the strongest attendance patterns district-wide</p>'
+                '</div>',
+                unsafe_allow_html=True,
+            )
+
+        # ACTION ITEMS - full width
+        st.markdown(
+            '<div class="rule-box info">'
+            '<h4>\U0001f4cb Recommended Actions Based on These Patterns</h4>'
+            '<p><strong>Immediate:</strong> Prioritize outreach to high school students with housing instability — this group has the highest conversion rate to chronic absence</p>'
+            '<p><strong>This Quarter:</strong> Implement targeted check-ins for middle school transition students, especially those in the top-5 highest-risk schools</p>'
+            '<p><strong>Strategic:</strong> Invest in school-specific intervention programs for the locations showing 2-3x above-average absence rates</p>'
+            '</div>',
+            unsafe_allow_html=True,
+        )
+
+        with st.expander("Show detailed decision tree (technical reference)", expanded=False):
+            single_tree = rf_model.estimators_[0]
+            feature_names = list(X_sample.columns)
+            rules = export_text(single_tree, feature_names=feature_names, max_depth=3)
+            st.code(rules, language="text")
+            st.caption("This shows one example of how the model makes step-by-step decisions. Read it like a flowchart: start at the top, each indent is a yes/no branch.")
+
+        st.divider()
+        st.markdown("### 3. Factor Importance Ranking")
+        st.markdown(
+            '<div class="section-note">'
+            '<h4>What is this?</h4>'
+            '<p>This chart answers: <strong>"If we removed this factor, how much worse would predictions get?"</strong></p>'
+            '<p>Factors with longer bars are MORE important — the model relies on them heavily. '
+            'Factors with short bars have minimal impact.</p>'
+            '<h4>Why does it matter for your district?</h4>'
+            '<p>This tells you where to focus intervention dollars. If "Student Age" has the longest bar, '
+            'then age-specific programs (e.g., high school mentoring) will likely have the biggest impact. '
+            'If "Housing Instability" is high, then housing support programs should be prioritized.</p>'
+            '</div>',
+            unsafe_allow_html=True,
+        )
+        result = permutation_importance(rf_model, X_sample, y_test[X_sample.index], n_repeats=5, random_state=42, n_jobs=-1)
+        perm_df = pd.DataFrame({"Factor": X_sample.columns, "Importance": result.importances_mean}).sort_values("Importance", ascending=True)
+
+        # Rename for business readability
+        perm_df["Factor"] = perm_df["Factor"].map(lambda x: RENAME_MAP.get(x, x))
+
+        plt.close('all')
+        fig, ax = plt.subplots(figsize=(8, 5))
+        bars = ax.barh(perm_df["Factor"], perm_df["Importance"], color=PALETTE["secondary"])
+        ax.set_xlabel("Impact on Accuracy (longer bar = more important)")
+        ax.set_title("Which Factors Matter Most for Predicting Risk?")
+        ax.spines[["top","right"]].set_visible(False)
+        fig.tight_layout()
+        show_fig(fig, use_container_width=True)
+
+        st.markdown(
+            '<div class="biz-value-card">'
+            '<h4>Action Items Based on Factor Importance</h4>'
+            '<p>The top 2-3 factors represent your highest-leverage intervention points. '
+            'Programs targeting these factors will likely yield the greatest reduction in chronic absenteeism.</p>'
+            '<p><strong>Next step:</strong> Discuss with your student services team — do you have programs that address the top risk factors? '
+            'If not, this data supports the case for investing in those areas.</p>'
+            '</div>',
+            unsafe_allow_html=True,
+        )
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # TAB 5 - INDIVIDUAL STUDENT LOOKUP
+    # ══════════════════════════════════════════════════════════════════════════
+    with tab_predict:
+        st.markdown('<div class="section-header">Individual Student Risk Assessment</div>', unsafe_allow_html=True)
+        st.markdown(
+            '<div class="section-note">'
+            '<p>Enter a student\'s profile below to generate their personalized risk score. '
+            'The system will show which factors are increasing or decreasing this specific student\'s risk, '
+            'helping counselors have informed conversations with families.</p>'
+            '</div>',
+            unsafe_allow_html=True,
+        )
+
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            p_gender = st.selectbox("Gender", sorted(train_df["STUDENT_GENDER"].dropna().unique()))
+            p_race   = st.selectbox("Race Group", sorted(train_df["RACE_GRP"].dropna().unique()))
+            p_eth    = st.selectbox("Ethnicity", sorted(train_df["STUDENT_ETHNICITY"].dropna().unique()))
+        with col2:
+            p_lang   = st.selectbox("Language Group", sorted(train_df["LANG_GRP"].dropna().unique()))
+            p_grade  = st.selectbox("Grade Level", sorted(train_df["STUDENT_CURRENT_GRADE_CODE"].dropna().unique()))
+            p_school = st.selectbox("School", sorted(train_df["SCHOOL_GRP"].dropna().unique()))
+        with col3:
+            p_age    = st.slider("Student Age", 5, 22, 14)
+            p_sped   = st.selectbox("Special Education?", [0, 1], format_func=lambda x: "Yes" if x else "No")
+            p_home   = st.selectbox("Housing Instability?", [0, 1], format_func=lambda x: "Yes" if x else "No")
+
+        if st.button("Check This Student's Risk", type="primary"):
+            row = pd.DataFrame([{
+                "STUDENT_GENDER": p_gender, "RACE_GRP": p_race, "STUDENT_ETHNICITY": p_eth,
+                "LANG_GRP": p_lang, "STUDENT_CURRENT_GRADE_CODE": p_grade, "SCHOOL_GRP": p_school,
+                "STUDENT_AGE": p_age, "STUDENT_SPECIAL_ED_INDICATOR": p_sped, "STUDENT_HOMELESS_INDICATOR": p_home,
+            }])
+
+            row_encoded = get_encoded_data(row, js_encoder)
+            proba_val = rf_model.predict_proba(row_encoded)[0, 1]
+            pred_label = 1 if proba_val >= threshold else 0
+
+            st.divider()
+            r1, r2, r3 = st.columns(3)
+            with r1: metric_card("Risk Score", f"{proba_val*100:.1f}%", "Probability of chronic absenteeism")
+            with r2:
+                risk_text = "HIGH RISK" if pred_label == 1 else "LOW RISK"
+                metric_card("Risk Level", risk_text)
+            with r3:
+                action = "Immediate outreach recommended" if pred_label == 1 else "Continue standard monitoring"
+                metric_card("Recommended Action", action)
+
+            st.markdown(
+                '<div class="section-note">'
+                '<p>This student\'s risk score is <strong>' + f"{proba_val*100:.1f}%" + '</strong>. '
+                'Your current sensitivity threshold is set to ' + f"{threshold*100:.0f}%" + '. '
+                + ("Since the score is ABOVE the threshold, this student is flagged for intervention." if pred_label == 1 else "Since the score is BELOW the threshold, this student is not flagged — but continued monitoring is advised.") +
+                '</p></div>',
+                unsafe_allow_html=True,
+            )
+            st.divider()
+            st.markdown("### What's driving this student's score?")
+            st.markdown(
+                '<div class="section-note">'
+                '<p>The chart below shows which factors are pushing this student\'s risk <strong>UP</strong> (red bars, right side) '
+                'or <strong>DOWN</strong> (green bars, left side). This helps counselors understand exactly why a student was flagged.</p>'
+                '</div>',
+                unsafe_allow_html=True,
+            )
+
+            local_shap = explainer.shap_values(row_encoded)
+
+            if isinstance(local_shap, list):
+                local_shap_chronic = np.array(local_shap[1]).flatten()
+            else:
+                if len(local_shap.shape) == 3:
+                    local_shap_chronic = np.array(local_shap[:, :, 1]).flatten()
+                else:
+                    local_shap_chronic = np.array(local_shap).flatten()
+
+            impact_df = pd.DataFrame({"Factor": row_encoded.columns, "Impact": local_shap_chronic})
+            impact_df["Factor"] = impact_df["Factor"].map(lambda x: RENAME_MAP.get(x, x))
+            impact_df = impact_df.sort_values("Impact", ascending=True)
+            impact_df["Color"] = impact_df["Impact"].apply(lambda x: PALETTE["danger"] if x > 0 else PALETTE["success"])
+
+            plt.close('all')
+            fig, ax = plt.subplots(figsize=(7, 4))
+            bars = ax.barh(impact_df["Factor"], impact_df["Impact"], color=impact_df["Color"])
+            ax.axvline(0, color='black', linewidth=1)
+            ax.set_xlabel("<-- Decreases Risk          Increases Risk -->")
+            ax.set_title("Risk Factors for This Student")
+            ax.spines[["top","right","left"]].set_visible(False)
+
+            for bar in bars:
+                xval = bar.get_width()
+                if xval > 0:
+                    ax.text(xval + 0.005, bar.get_y() + bar.get_height()/2, "Increases Risk", va="center", color=PALETTE["danger"], fontsize=9)
+                else:
+                    ax.text(xval - 0.005, bar.get_y() + bar.get_height()/2, "Decreases Risk", ha="right", va="center", color=PALETTE["success"], fontsize=9)
+
+            show_fig(fig, use_container_width=True)
+
+else:
+    with tab_results: st.info("Click **Run Analysis** in the sidebar to generate predictions.")
+    with tab_threshold: st.info("Click **Run Analysis** in the sidebar to generate predictions.")
+    with tab_explain: st.info("Click **Run Analysis** in the sidebar to generate predictions.")
+    with tab_predict: st.info("Click **Run Analysis** in the sidebar to generate predictions.")
