@@ -231,6 +231,7 @@ def get_encoded_data(df, encoder):
 
 
 def show_fig(fig, **kwargs):
+    kwargs.pop("use_container_width", None)
     try:
         st.pyplot(fig, **kwargs)
     except Exception as exc:
@@ -306,7 +307,7 @@ with st.sidebar:
     )
 
     st.divider()
-    run_btn = st.button("Run Analysis", type="primary", disabled=not files_ok, use_container_width=True)
+    run_btn = st.button("Run Analysis", type="primary", disabled=not files_ok)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -878,7 +879,6 @@ if True:
             data=buffer.getvalue(),
             file_name="student_risk_report.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.ml.sheet",
-            use_container_width=True,
         )
 
     # ══════════════════════════════════════════════════════════════════════════
@@ -941,7 +941,6 @@ if True:
 
         st.dataframe(
             thr_df_tuner.style.background_gradient(subset=["Catch Rate", "Alert Accuracy", "Overall Score (F1)"], cmap="Blues"),
-            use_container_width=True
         )
 
     # ══════════════════════════════════════════════════════════════════════════
