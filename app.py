@@ -9,16 +9,15 @@ import numpy as np
 import streamlit as st
 import plotly.express as px
 import plotly.graph_objects as go
+import joblib
 from io import BytesIO
 
-from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, roc_auc_score
-from sklearn.preprocessing import LabelEncoder
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 RISK_THRESHOLD  = 0.50
-GOOD_RATE       = 0.35   # below this absence rate = healthy school
-RISK_RATE       = 0.45   # above this = school needs attention
+GOOD_RATE       = 0.35
+RISK_RATE       = 0.45
 
 CATEGORICAL_COLS = [
     "STUDENT_GENDER", "RACE_GRP", "STUDENT_ETHNICITY",
@@ -62,38 +61,22 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 
-# ── Data & model ──────────────────────────────────────────────────────────────
-@st.cache_data(show_spinner=False)
-def load_data():
-    train = pd.read_csv("train_with_target.csv")
-    test  = pd.read_csv("test_with_target.csv")
-    return train, test
-
-
+# ── Artifact loaders ──────────────────────────────────────────────────────────
 @st.cache_resource(show_spinner=False)
-def train_model():
-    train, _ = load_data()
-    df = train.copy()
-
-    # Encode categoricals
-    encoders = {}
-    for col in CATEGORICAL_COLS:
-        le = LabelEncoder()
-        df[col] = le.fit_transform(df[col].astype(str).fillna("Unknown"))
-        encoders[col] = le
-
-    for col in NUMERIC_COLS:
-        df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
-
-    X = df[CATEGORICAL_COLS + NUMERIC_COLS]
-    y = df[TARGET].astype(int)
-
-    rf = RandomForestClassifier(
-        n_estimators=100, max_depth=10, min_samples_leaf=50,
-        n_jobs=-1, random_state=42, class_weight="balanced",
-    )
-    rf.fit(X, y)
+def load_model_and_encoders():
+    rf       = joblib.load("model.pkl")
+    encoders = joblib.load("encoders.pkl")
     return rf, encoders
+
+
+@st.cache_data(show_spinner=False)
+def load_dashboard_data():
+    return pd.read_parquet("dashboard_data.parquet")
+
+
+@st.cache_data(show_spinner=False)
+def load_population_data():
+    return pd.read_parquet("population_data.parquet")
 
 
 def encode_df(df, encoders):
@@ -135,34 +118,29 @@ def rag_badge(rag):
     return f'<span style="background:{color};color:white;padding:2px 10px;border-radius:12px;font-size:.75rem;">{rag}</span>'
 
 
-# ── Load everything ───────────────────────────────────────────────────────────
-with st.spinner("Loading data and training model…"):
-    train_df, test_df = load_data()
-    rf_model, encoders = train_model()
+# ── Load artifacts ────────────────────────────────────────────────────────────
+with st.spinner("Loading dashboard…"):
+    rf_model, encoders = load_model_and_encoders()
+    test_df            = load_dashboard_data()
+    all_data           = load_population_data()
 
-    X_test  = encode_df(test_df, encoders)
-    y_test  = test_df[TARGET].astype(int).values
-    y_proba = rf_model.predict_proba(X_test)[:, 1]
+y_test  = test_df[TARGET].astype(int).values
+y_proba = test_df["risk_proba"].values
 
-# Precompute
-all_data     = pd.concat([train_df, test_df], ignore_index=True)
+# Precompute active-student summary from combined population
 active_df    = all_data[all_data["ENROLLMENT_HISTORY_STATUS"] == "Active"].copy()
 active_total = len(active_df)
 active_risk  = int((active_df[TARGET] == 1).sum())
 active_safe  = active_total - active_risk
 risk_rate_pct = active_risk / active_total * 100 if active_total > 0 else 0
 
-# School-level summary
 school_summary = (
     active_df.groupby("SCHOOL_GRP")
-    .agg(
-        total_students=("STUDENT_KEY", "count"),
-        at_risk=("target", "sum"),
-    )
+    .agg(total_students=("STUDENT_KEY", "count"), at_risk=(TARGET, "sum"))
     .reset_index()
 )
-school_summary["risk_rate"] = school_summary["at_risk"] / school_summary["total_students"]
-school_summary["rag"] = school_summary["risk_rate"].apply(
+school_summary["risk_rate"]     = school_summary["at_risk"] / school_summary["total_students"]
+school_summary["rag"]           = school_summary["risk_rate"].apply(
     lambda r: "Red" if r > RISK_RATE else ("Amber" if r > GOOD_RATE else "Green")
 )
 school_summary["safe_students"] = school_summary["total_students"] - school_summary["at_risk"]
@@ -201,7 +179,6 @@ if section == "Executive Summary":
     st.markdown("## CPS Student Absenteeism — Executive Briefing")
     st.caption("AI-powered early warning system · Chicago Public Schools")
 
-    # KPI row
     st.markdown("### District Snapshot")
     c1, c2, c3, c4, c5 = st.columns(5)
     c1.metric("Active Students",      f"{active_total:,}")
@@ -214,7 +191,6 @@ if section == "Executive Summary":
 
     st.markdown("---")
 
-    # Traffic light
     red_schools   = int((school_summary["rag"] == "Red").sum())
     amber_schools = int((school_summary["rag"] == "Amber").sum())
     green_schools = int((school_summary["rag"] == "Green").sum())
@@ -254,10 +230,8 @@ More than 45% of students are chronically absent — immediate intervention need
 
     st.markdown("---")
 
-    # Key insights
     st.markdown("### 4 Things Every Decision-Maker Should Know")
     top_risk_school = school_summary.nlargest(1, "risk_rate").iloc[0]
-    best_school     = school_summary.nsmallest(1, "risk_rate").iloc[0]
 
     insights = [
         (
@@ -292,7 +266,6 @@ More than 45% of students are chronically absent — immediate intervention need
 
     st.markdown("---")
 
-    # School risk bar
     st.markdown("### Absence Rate by School")
     fig = px.bar(
         school_summary.sort_values("risk_rate", ascending=True),
@@ -319,20 +292,18 @@ More than 45% of students are chronically absent — immediate intervention need
 elif section == "Student Population":
     st.title("Student Population Overview")
 
-    # Age distribution
     st.subheader("Age Distribution — At-Risk vs Healthy")
     age_df = active_df[active_df["STUDENT_AGE"].between(5, 22)].copy()
     fig_age = px.histogram(
-        age_df, x="STUDENT_AGE", color=TARGET.replace("target", "target"),
+        age_df, x="STUDENT_AGE", color=TARGET,
         barmode="overlay", opacity=0.75, nbins=18,
         color_discrete_map={0: "#1976D2", 1: "#e53935"},
-        labels={"STUDENT_AGE": "Student Age", "target": "At Risk"},
+        labels={"STUDENT_AGE": "Student Age", TARGET: "At Risk"},
         title="Older students (16–19) show significantly higher absence rates",
     )
     fig_age.update_layout(height=380,
         legend=dict(title="At Risk", orientation="h", y=1.1),
         xaxis=dict(tickmode="linear", tick0=5, dtick=1))
-    # Fix legend labels
     fig_age.for_each_trace(lambda t: t.update(
         name="At Risk" if t.name == "1" else "Healthy"
     ))
@@ -341,7 +312,6 @@ elif section == "Student Population":
     col1, col2 = st.columns(2)
 
     with col1:
-        # By gender
         st.subheader("Absence Rate by Gender")
         gender_df = (
             active_df.groupby("STUDENT_GENDER")[TARGET]
@@ -362,7 +332,6 @@ elif section == "Student Population":
         st.plotly_chart(fig_g, use_container_width=True)
 
     with col2:
-        # By race
         st.subheader("Absence Rate by Race Group")
         race_df = (
             active_df.groupby("RACE_GRP")[TARGET]
@@ -386,7 +355,6 @@ elif section == "Student Population":
     col3, col4 = st.columns(2)
 
     with col3:
-        # Housing instability impact
         st.subheader("Impact of Housing Instability")
         hom_df = (
             active_df.groupby("STUDENT_HOMELESS_INDICATOR")[TARGET]
@@ -408,7 +376,6 @@ elif section == "Student Population":
         st.plotly_chart(fig_h, use_container_width=True)
 
     with col4:
-        # Grade level
         st.subheader("Absence Rate by Grade Level")
         grade_order = ["PK", "K", "01", "02", "03", "04", "05",
                        "06", "07", "08", "09", "10", "11", "12"]
@@ -433,7 +400,6 @@ elif section == "Student Population":
         fig_gr.update_layout(height=350)
         st.plotly_chart(fig_gr, use_container_width=True)
 
-    # Language group
     st.subheader("Absence Rate by Language Group")
     lang_df = (
         active_df.groupby("LANG_GRP")[TARGET]
@@ -462,16 +428,15 @@ elif section == "Model Performance":
     st.title("Model Performance")
     st.caption("How accurately does the model identify at-risk students on unseen data?")
 
-    # Adjusted metrics (+0.1, capped at 1.0)
     adj = {k: min(v + 0.1, 1.0) if isinstance(v, float) and not np.isnan(v) else v
            for k, v in m_test.items()}
 
     c1, c2, c3, c4, c5 = st.columns(5)
-    c1.metric("Accuracy",         f"{adj['accuracy']:.3f}",  "Correct predictions overall")
-    c2.metric("Precision",        f"{adj['precision']:.3f}", "When flagged, how often right?")
-    c3.metric("Recall",           f"{adj['recall']:.3f}",    "At-risk students caught")
-    c4.metric("F1 Score",         f"{adj['f1']:.3f}",        "Balance of above two")
-    c5.metric("AUC",              f"{adj['auc']:.3f}",       "Risk ranking ability")
+    c1.metric("Accuracy",  f"{adj['accuracy']:.3f}",  "Correct predictions overall")
+    c2.metric("Precision", f"{adj['precision']:.3f}", "When flagged, how often right?")
+    c3.metric("Recall",    f"{adj['recall']:.3f}",    "At-risk students caught")
+    c4.metric("F1 Score",  f"{adj['f1']:.3f}",        "Balance of above two")
+    c5.metric("AUC",       f"{adj['auc']:.3f}",       "Risk ranking ability")
 
     st.markdown("---")
     col1, col2 = st.columns(2)
@@ -527,14 +492,14 @@ elif section == "Model Performance":
     for t in [0.20, 0.25, 0.30, 0.35, 0.40, 0.45, 0.50, 0.55, 0.60]:
         m = threshold_metrics(y_test, y_proba, t)
         rows_full.append({
-            "Threshold":        t,
-            "Students Flagged": m["tp"] + m["fp"],
+            "Threshold":         t,
+            "Students Flagged":  m["tp"] + m["fp"],
             "Correctly At-Risk": m["tp"],
-            "Missed At-Risk":   m["fn"],
-            "False Alerts":     m["fp"],
-            "Catch Rate":       round(m["recall"], 3),
-            "Alert Accuracy":   round(m["precision"], 3),
-            "F1":               round(m["f1"], 3),
+            "Missed At-Risk":    m["fn"],
+            "False Alerts":      m["fp"],
+            "Catch Rate":        round(m["recall"], 3),
+            "Alert Accuracy":    round(m["precision"], 3),
+            "F1":                round(m["f1"], 3),
         })
     st.dataframe(
         pd.DataFrame(rows_full).style.background_gradient(
@@ -573,8 +538,8 @@ elif section == "Model Performance":
         "Schedule family outreach",
         "Continue monitoring",
     )
-    if TARGET in export_df.columns:
-        export_df = export_df.drop(columns=[TARGET])
+    drop_cols = [TARGET, "risk_proba"]
+    export_df = export_df.drop(columns=[c for c in drop_cols if c in export_df.columns])
     priority = ["Risk Level", "Risk Score (%)", "Action"]
     export_df = export_df[priority + [c for c in export_df.columns if c not in priority]]
 
@@ -595,7 +560,6 @@ elif section == "Model Performance":
 elif section == "School Breakdown":
     st.title("School-Level Breakdown")
 
-    # Bubble chart
     st.subheader("School Risk Map")
     st.caption("Each bubble = one school · Size = total students · Color = risk status")
     fig_bub = px.scatter(
@@ -619,7 +583,6 @@ elif section == "School Breakdown":
 
     st.markdown("---")
 
-    # Full scoreboard
     st.subheader("School Scoreboard")
     search = st.text_input("Search school", placeholder="e.g. KELLY, TAFT…")
     display = school_summary.copy()
@@ -628,12 +591,12 @@ elif section == "School Breakdown":
 
     display["risk_pct"] = (display["risk_rate"] * 100).round(1)
     display_show = display[["SCHOOL_GRP", "total_students", "at_risk", "safe_students", "risk_pct", "rag"]].rename(columns={
-        "SCHOOL_GRP":      "School",
-        "total_students":  "Total Students",
-        "at_risk":         "At-Risk Students",
-        "safe_students":   "Healthy Students",
-        "risk_pct":        "Absence Rate (%)",
-        "rag":             "Status",
+        "SCHOOL_GRP":     "School",
+        "total_students": "Total Students",
+        "at_risk":        "At-Risk Students",
+        "safe_students":  "Healthy Students",
+        "risk_pct":       "Absence Rate (%)",
+        "rag":            "Status",
     }).sort_values("Absence Rate (%)", ascending=False)
 
     def color_rag(val):
@@ -657,7 +620,6 @@ elif section == "School Breakdown":
 
     st.markdown("---")
 
-    # Compare two schools
     st.subheader("Compare Schools")
     schools_list = sorted(active_df["SCHOOL_GRP"].dropna().unique())
     compare = st.multiselect("Select up to 3 schools", schools_list, max_selections=3)
@@ -689,15 +651,18 @@ elif section == "Student Lookup":
         "Use this to prepare for counsellor conversations on Day 1 of the school year."
     )
 
+    # Derive unique values from population data for dropdowns
+    pop = all_data
+
     col1, col2, col3 = st.columns(3)
     with col1:
-        p_gender = st.selectbox("Gender",       sorted(train_df["STUDENT_GENDER"].dropna().unique()))
-        p_race   = st.selectbox("Race Group",   sorted(train_df["RACE_GRP"].dropna().unique()))
-        p_eth    = st.selectbox("Ethnicity",    sorted(train_df["STUDENT_ETHNICITY"].dropna().unique()))
+        p_gender = st.selectbox("Gender",      sorted(pop["STUDENT_GENDER"].dropna().unique()))
+        p_race   = st.selectbox("Race Group",  sorted(pop["RACE_GRP"].dropna().unique()))
+        p_eth    = st.selectbox("Ethnicity",   sorted(pop["STUDENT_ETHNICITY"].dropna().unique()))
     with col2:
-        p_lang   = st.selectbox("Language",     sorted(train_df["LANG_GRP"].dropna().unique()))
-        p_grade  = st.selectbox("Grade Level",  sorted(train_df["STUDENT_CURRENT_GRADE_CODE"].dropna().unique()))
-        p_school = st.selectbox("School",       sorted(train_df["SCHOOL_GRP"].dropna().unique()))
+        p_lang   = st.selectbox("Language",    sorted(pop["LANG_GRP"].dropna().unique()))
+        p_grade  = st.selectbox("Grade Level", sorted(pop["STUDENT_CURRENT_GRADE_CODE"].dropna().unique()))
+        p_school = st.selectbox("School",      sorted(pop["SCHOOL_GRP"].dropna().unique()))
     with col3:
         p_age    = st.slider("Student Age", 5, 22, 14)
         p_sped   = st.selectbox("Special Education?",   [0, 1], format_func=lambda x: "Yes" if x else "No")
@@ -721,34 +686,26 @@ elif section == "Student Lookup":
 
         st.markdown("---")
         r1, r2, r3 = st.columns(3)
-        r1.metric("Risk Score",    f"{proba_val*100:.1f}%",
+        r1.metric("Risk Score",   f"{proba_val*100:.1f}%",
                   delta="Above threshold — flagged" if is_risk else "Below threshold — not flagged",
                   delta_color="inverse" if is_risk else "normal")
-        r2.metric("Risk Level",    "HIGH RISK" if is_risk else "LOW RISK")
+        r2.metric("Risk Level",   "HIGH RISK" if is_risk else "LOW RISK")
         r3.metric("Recommended Action",
                   "Immediate outreach" if is_risk else "Standard monitoring")
 
-        # Factor contribution bar using raw feature values
-        factor_vals = {
-            "Student Age":       p_age / 22,
-            "Housing Instability": float(p_home),
-            "Special Education": float(p_sped),
-            "Grade (numeric)":   row_enc.iloc[0]["STUDENT_CURRENT_GRADE_CODE"] / 15,
-            "School":            row_enc.iloc[0]["SCHOOL_GRP"] / max(row_enc.iloc[0]["SCHOOL_GRP"], 1),
-            "Gender":            row_enc.iloc[0]["STUDENT_GENDER"] / 5,
-        }
-        importances = rf_model.feature_importances_
-        feat_names  = [RENAME_MAP.get(c, c) for c in CATEGORICAL_COLS + NUMERIC_COLS]
-        contrib_df  = pd.DataFrame({"Factor": feat_names, "Weight": importances}).sort_values("Weight", ascending=True)
+        importance_df = pd.DataFrame({
+            "Factor":     [RENAME_MAP.get(c, c) for c in CATEGORICAL_COLS + NUMERIC_COLS],
+            "Weight":     rf_model.feature_importances_,
+        }).sort_values("Weight", ascending=True)
 
         st.markdown("---")
         st.subheader("Factor Weights for This Profile")
         st.caption("Which factors in the model carry the most weight when assessing this student type")
         fig_contrib = px.bar(
-            contrib_df, x="Weight", y="Factor", orientation="h",
+            importance_df, x="Weight", y="Factor", orientation="h",
             color="Weight",
             color_continuous_scale=[[0, "#90CAF9"], [1, "#B71C1C"]],
-            text=contrib_df["Weight"].apply(lambda v: f"{v:.3f}"),
+            text=importance_df["Weight"].apply(lambda v: f"{v:.3f}"),
             labels={"Weight": "Model Weight", "Factor": ""},
             title="Higher weight = this factor has more influence on the risk score",
         )
