@@ -501,12 +501,9 @@ elif section == "Model Performance":
             "Alert Accuracy":    round(m["precision"], 3),
             "F1":                round(m["f1"], 3),
         })
-    st.dataframe(
-        pd.DataFrame(rows_full).style.background_gradient(
-            subset=["Catch Rate", "Alert Accuracy", "F1"], cmap="Blues"
-        ),
-        use_container_width=True,
-    )
+    # show the sensitivity table without background gradient (avoids requiring matplotlib)
+    rows_df = pd.DataFrame(rows_full)
+    st.dataframe(rows_df, use_container_width=True)
 
     st.markdown("---")
     st.subheader("Feature Importance")
