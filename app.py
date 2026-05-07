@@ -231,6 +231,7 @@ def get_encoded_data(df, encoder):
 
 
 def show_fig(fig, **kwargs):
+    kwargs.pop("use_container_width", None)
     try:
         st.pyplot(fig, **kwargs)
     except Exception as exc:
