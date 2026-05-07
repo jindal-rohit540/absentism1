@@ -14,7 +14,7 @@ from io import BytesIO
 
 from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, roc_auc_score
 
-# ── Constants ─────────────────────────────────────────────────────────────────
+# ── Constants ────────────────────────────────────────────────────────────
 RISK_THRESHOLD  = 0.50
 GOOD_RATE       = 0.35
 RISK_RATE       = 0.45
@@ -40,7 +40,7 @@ RENAME_MAP = {
     "STUDENT_HOMELESS_INDICATOR":   "Housing Instability",
 }
 
-# ── Page config ───────────────────────────────────────────────────────────────
+# ── Page config ──────────────────────────────────────────────────────────
 st.set_page_config(
     page_title="CPS Absenteeism Risk",
     page_icon="📘",
@@ -118,7 +118,7 @@ def rag_badge(rag):
     return f'<span style="background:{color};color:white;padding:2px 10px;border-radius:12px;font-size:.75rem;">{rag}</span>'
 
 
-# ── Load artifacts ────────────────────────────────────────────────────────────
+# ── Load artifacts ──────────────────────────────────────────────────────────
 with st.spinner("Loading dashboard…"):
     rf_model, encoders = load_model_and_encoders()
     test_df            = load_dashboard_data()
@@ -145,8 +145,19 @@ school_summary["rag"]           = school_summary["risk_rate"].apply(
 )
 school_summary["safe_students"] = school_summary["total_students"] - school_summary["at_risk"]
 
+# Compute display counts for schools: separate 'Other' (or similar) from named schools.
+# This prevents showing a single lumped count like "21" when you really have 20 named schools + 1 'Other' bucket.
+ss = school_summary["SCHOOL_GRP"].fillna("").astype(str)
+other_mask = ss.str.lower().str.contains("other")
+num_other = int(other_mask.sum())
+num_named_schools = int((~other_mask).sum())
+if num_other > 0:
+    schools_display_text = f"{num_named_schools} schools + {num_other} other"
+else:
+    schools_display_text = f"{num_named_schools} schools"
 
-# ── Sidebar ───────────────────────────────────────────────────────────────────
+
+# ── Sidebar ─────────────────────────────────────────────────────────────
 with st.sidebar:
     st.markdown("## 📘 Absenteeism Risk")
     st.markdown("---")
@@ -164,7 +175,7 @@ with st.sidebar:
     st.caption(
         f"**Total students:** {active_total:,}  \n"
         f"**At-risk (active):** {active_risk:,} ({risk_rate_pct:.1f}%)  \n"
-        f"**Schools:** {school_summary['SCHOOL_GRP'].nunique()}"
+        f"**Schools:** {schools_display_text}"
     )
 
 m_test = threshold_metrics(y_test, y_proba, threshold)
@@ -172,9 +183,9 @@ pred_labels = (y_proba >= threshold).astype(int)
 flagged = int(pred_labels.sum())
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════
 # ① EXECUTIVE SUMMARY
-# ═══════════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════
 if section == "Executive Summary":
     st.markdown("## CPS Student Absenteeism — Executive Briefing")
     st.caption("AI-powered early warning system · Chicago Public Schools")
@@ -184,7 +195,7 @@ if section == "Executive Summary":
     c1.metric("Active Students",      f"{active_total:,}")
     c2.metric("At-Risk Students",     f"{active_risk:,}",
               delta=f"{risk_rate_pct:.1f}% of total", delta_color="inverse")
-    c3.metric("Schools Monitored",    f"{school_summary['SCHOOL_GRP'].nunique()}")
+    c3.metric("Schools Monitored",    f"{schools_display_text}")
     c4.metric("Model Flags Today",    f"{flagged:,}",
               help=f"Students above {threshold:.0%} risk threshold on test set")
     c5.metric("Model Accuracy",       f"{min(m_test['accuracy']+0.1,1):.1%}")
@@ -286,9 +297,9 @@ More than 45% of students are chronically absent — immediate intervention need
     st.plotly_chart(fig, use_container_width=True)
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════
 # ② STUDENT POPULATION
-# ═══════════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════
 elif section == "Student Population":
     st.title("Student Population Overview")
 
@@ -421,9 +432,9 @@ elif section == "Student Population":
     st.plotly_chart(fig_l, use_container_width=True)
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════
 # ③ MODEL PERFORMANCE
-# ═══════════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════
 elif section == "Model Performance":
     st.title("Model Performance")
     st.caption("How accurately does the model identify at-risk students on unseen data?")
@@ -554,9 +565,9 @@ elif section == "Model Performance":
     )
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════
 # ④ SCHOOL BREAKDOWN
-# ═══════════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════
 elif section == "School Breakdown":
     st.title("School-Level Breakdown")
 
@@ -641,9 +652,9 @@ elif section == "School Breakdown":
         st.plotly_chart(fig_cmp, use_container_width=True)
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════
 # ⑤ STUDENT LOOKUP
-# ═══════════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════
 elif section == "Student Lookup":
     st.title("Individual Student Risk Assessment")
     st.markdown(
